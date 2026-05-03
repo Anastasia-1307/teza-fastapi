@@ -414,7 +414,7 @@ def add_password(password_data: PasswordCreate, request: Request, current_user: 
         raise
     except Exception as e:
         print(f"ERROR creating password: {str(e)}")
-        raise HTTPException(status_code=500, detail="Eroare internã de server")
+        raise HTTPException(status_code=500, detail="Eroare internă de server")
 
 @app.get("/passwords", response_model=list[PasswordResponse])
 def get_passwords(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -451,7 +451,7 @@ def get_password(password_id: str, current_user: User = Depends(get_current_user
     try:
         password = get_password_by_id(db, password_id, str(current_user.id))
         if not password:
-            raise HTTPException(status_code=404, detail="Parola nu a fost găsitã")
+            raise HTTPException(status_code=404, detail="Parola nu a fost găsită")
         
         # Decrypt the password
         decrypted_password = decrypt_password(password.password_encrypted)
