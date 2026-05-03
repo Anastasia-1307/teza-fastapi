@@ -308,45 +308,6 @@ def biometric_verify(request: Request, form_data: LoginForm, db: Session = Depen
         "login_method": "biometric_aes"
     }
 
-@app.post("/auth")
-def auth(request: Request, form_data: LoginForm, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.username == form_data.username).first()
-    if not user or not verify_password(form_data.password, user.password_hash):
-        # Log failed login attempt
-        if user:
-            log_user_action(
-                user_id=str(user.id),
-                action="login_failed",
-                request=request,
-                details=f"Failed login attempt for user {user.username}: wrong password",
-                db=db
-            )
-        else:
-            log_user_action(
-                user_id=None,
-                action="login_failed",
-                request=request,
-                details=f"Failed login attempt: username {form_data.username} not found",
-                db=db
-            )
-        raise HTTPException(status_code=401, detail="Credențiale invalide")
-    
-    token_access = create_access_token({"sub": str(user.id), "role": user.role, "username": user.username })
-    token_refresh = create_refresh_token({"sub": str(user.id)})
-    new_refresh = RefreshToken(token = token_refresh, user_id = user.id, expires_at = datetime.utcnow() + timedelta(days=7))
-    db.add(new_refresh)
-    db.commit()
-    
-    # Log successful login
-    log_user_action(
-        user_id=str(user.id),
-        action="login",
-        request=request,
-        details=f"User {user.username} logged in successfully",
-        db=db
-    )
-    
-    return {"access_token": token_access, "refresh_token": token_refresh, "token_type": "bearer"}
 
 # user, admin
 @app.post("/user")
