@@ -595,7 +595,7 @@ def check_ip_block(request: Request, db: Session) -> tuple[bool, Optional[IPAddr
     
     return is_blocked, ip_block
 
-def block_ip_address(ip_address: str, block_duration: int, username: str = None, failed_attempts: int = 1, user_id: str = None, db: Session = None):
+def block_ip_address(ip_address: str, block_duration: int, username: str = None, failed_attempts: int = 1, db: Session = None):
     
     if not db:
         raise ValueError("Database session is required")
@@ -607,8 +607,7 @@ def block_ip_address(ip_address: str, block_duration: int, username: str = None,
         ip_address=ip_address,
         block_duration=block_duration,
         username=username,
-        failed_attempts=failed_attempts,
-        user_id=user_id
+        failed_attempts=failed_attempts
     )
     
     print(f"IP BLOCKED: {ip_address} for {block_duration}ms by user {username}")

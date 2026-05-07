@@ -46,7 +46,7 @@ app = FastAPI(title="FastAPI Auth Server v4 - FIXED")
 def root():
     return {"message": "FastAPI Auth Server is running", "docs": "/docs", "redoc": "/redoc"}
 
-origins = ["http://localhost:8081", "http://192.168.0.15:8081", "http://127.0.0.1:8081", "*" ]
+origins = ["http://localhost:8081", "http://192.168.0.15:8081", "http://127.0.0.1:8081", "http://10.22.242.11:8081", "*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -177,7 +177,6 @@ def auth(request: Request, form_data: LoginForm, db: Session = Depends(get_db)):
                 block_duration=delay,
                 username=form_data.username,
                 failed_attempts=failed_attempts,
-                user_id=str(user.id) if user else None,
                 db=db
             )
             
@@ -977,8 +976,7 @@ def create_ip_block_admin(
             ip_address=block_data.ip_address,
             block_duration=block_data.block_duration,
             username=block_data.username,
-            failed_attempts=block_data.failed_attempts,
-            user_id=None  # Admin created, not user-triggered
+            failed_attempts=block_data.failed_attempts
         )
         
         # Log admin action

@@ -87,7 +87,7 @@ def verify_user_password(db: Session, username: str, password: str) -> bool:
     return False
 
 # IP Address Blocking CRUD operations
-def create_ip_block(db: Session, ip_address: str, block_duration: int, username: str = None, failed_attempts: int = 1, user_id: str = None):
+def create_ip_block(db: Session, ip_address: str, block_duration: int, username: str = None, failed_attempts: int = 1):
     """Create a new IP address block"""
     from datetime import datetime, timedelta
     
@@ -112,8 +112,7 @@ def create_ip_block(db: Session, ip_address: str, block_duration: int, username:
         is_active=True,
         username=username,
         failed_attempts=failed_attempts,
-        expires_at=expires_at,
-        user_id=user_id
+        expires_at=expires_at
     )
     
     db.add(ip_block)

@@ -78,4 +78,3 @@ class IPAddressBlocked(Base):
     username = Column(String(50))  # Username that triggered the block
     failed_attempts = Column(Integer, default=1)
     expires_at = Column(DateTime)  # When the block expires
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)

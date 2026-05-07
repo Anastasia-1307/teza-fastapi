@@ -131,7 +131,6 @@ class IPAddressBlockedResponse(BaseModel):
     username: Optional[str] = None
     failed_attempts: int
     expires_at: Optional[datetime] = None
-    user_id: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
