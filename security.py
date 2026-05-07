@@ -274,6 +274,22 @@ def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta]
     encoded_jwt = jwt.encode(to_encode, secret_key, algorithm=ALGORITHM)
     return encoded_jwt
 
+def hash_token(token: str) -> str:
+    """
+    Hash a token using Argon2ID for secure storage
+    """
+    return ph.hash(token)
+
+def verify_hashed_token(token: str, token_hash: str) -> bool:
+    """
+    Verify a token against its hash
+    """
+    try:
+        ph.verify(token_hash, token)
+        return True
+    except VerifyMismatchError:
+        return False
+
 def create_refresh_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
   
     to_encode = data.copy()
@@ -437,22 +453,19 @@ def revoke_all_user_tokens(db: Session, user_id: str) -> int:
             models.RefreshToken.expires_at > datetime.utcnow()).all()
         revoked_count = 0
         for token in refresh_tokens:
-            # Decode to get jti
-            try:
-                payload = jwt.decode(token.token, secret_key, algorithms=[ALGORITHM], options={"verify_signature": False})
-                jti = payload.get("jti")
-                if jti:
-                    # Check if already blacklisted
-                    existing = db.query(models.BlacklistedToken).filter(models.BlacklistedToken.jti == jti).first()
-                    if not existing:
-                        blacklisted_token = models.BlacklistedToken(
-                            jti=jti,
-                            expires_at=token.expires_at,
-                            created_at=datetime.utcnow())
-                        db.add(blacklisted_token)
-                        revoked_count += 1
-            except jwt.PyJWTError:
-                continue
+            # Use the stored JTI instead of trying to decode hashed token
+            jti = token.token_jti
+            if jti:
+                # Check if already blacklisted
+                existing = db.query(models.BlacklistedToken).filter(models.BlacklistedToken.jti == jti).first()
+                if not existing:
+                    blacklisted_token = models.BlacklistedToken(
+                        jti=jti,
+                        expires_at=token.expires_at,
+                        created_at=datetime.utcnow())
+                    db.add(blacklisted_token)
+                    revoked_count += 1
+        
         # Delete refresh tokens
         db.query(models.RefreshToken).filter(
             models.RefreshToken.user_id == user_id).delete()
@@ -645,4 +658,173 @@ def format_duration_ms(ms: int) -> str:
     else:
         hours = seconds // 3600
         return f"{hours} hours" if hours != 1 else "1 hour"
+
+def create_persistent_refresh_token(user_id: str) -> tuple[str, str]:
+    """
+    Create a persistent refresh token that lasts 30 days
+    Returns: (token, token_hash)
+    """
+    token = create_refresh_token({"sub": user_id})
+    token_hash = hash_token(token)  # Now uses Argon2ID
+    return token, token_hash
+
+def get_or_create_persistent_refresh_token(db: Session, user_id: str) -> tuple[str, str]:
+    """
+    Get existing valid persistent refresh token or create a new one
+    Returns: (token, token_hash)
+    """
+    try:
+        from models import PersistentRefreshToken
+        
+        # Check if user has an active, non-expired persistent token
+        existing_token = db.query(PersistentRefreshToken).filter(
+            PersistentRefreshToken.user_id == user_id,
+            PersistentRefreshToken.is_active == True,
+            PersistentRefreshToken.expires_at > datetime.utcnow()
+        ).first()
+        
+        if existing_token:
+            print(f"DEBUG: Reusing existing persistent refresh token for user {user_id}, ID: {existing_token.id}")
+            # Update last_used timestamp
+            existing_token.last_used = datetime.utcnow()
+            db.commit()
+            
+            # We need to return the actual token, but we only have the hash
+            # Since we can't reconstruct the original token from the hash,
+            # we'll need to create a new token and update the hash
+            print(f"DEBUG: Creating new token to replace expired one (hash-only storage limitation)")
+            new_token, new_token_hash = create_persistent_refresh_token(user_id)
+            existing_token.token_hash = new_token_hash
+            existing_token.last_used = datetime.utcnow()
+            existing_token.expires_at = datetime.utcnow() + timedelta(days=30)
+            db.commit()
+            print(f"DEBUG: Updated persistent refresh token with new hash, ID: {existing_token.id}")
+            return new_token, new_token_hash
+        else:
+            print(f"DEBUG: No valid existing token found, creating new persistent refresh token for user {user_id}")
+            new_token, new_token_hash = create_persistent_refresh_token(user_id)
+            store_persistent_refresh_token(db, user_id, new_token_hash)
+            return new_token, new_token_hash
+            
+    except Exception as e:
+        print(f"ERROR in get_or_create_persistent_refresh_token: {e}")
+        db.rollback()
+        # Fallback: create new token
+        new_token, new_token_hash = create_persistent_refresh_token(user_id)
+        return new_token, new_token_hash
+
+def store_persistent_refresh_token(db: Session, user_id: str, token_hash: str, deactivate_existing: bool = False) -> bool:
+    """
+    Store a persistent refresh token in the database
+    If deactivate_existing is True, deactivate all existing tokens for this user
+    """
+    try:
+        from models import PersistentRefreshToken
+        
+        print(f"DEBUG: Storing persistent refresh token for user {user_id}")
+        print(f"DEBUG: Token hash (first 50 chars): {token_hash[:50]}...")
+        
+        # Deactivate existing tokens for this user/device only if requested
+        if deactivate_existing:
+            existing_tokens = db.query(PersistentRefreshToken).filter(
+                PersistentRefreshToken.user_id == user_id,
+                PersistentRefreshToken.is_active == True
+            ).all()
+            
+            for token in existing_tokens:
+                token.is_active = False
+            print(f"DEBUG: Deactivated {len(existing_tokens)} existing tokens for user {user_id}")
+        
+        # Create new persistent token
+        persistent_token = PersistentRefreshToken(
+            user_id=user_id,
+            token_hash=token_hash,
+            expires_at=datetime.utcnow() + timedelta(days=30)
+        )
+        
+        db.add(persistent_token)
+        db.commit()
+        print(f"DEBUG: Persistent refresh token stored successfully with ID: {persistent_token.id}")
+        return True
+        
+    except Exception as e:
+        print(f"ERROR storing persistent refresh token: {e}")
+        db.rollback()
+        return False
+
+def verify_persistent_refresh_token(db: Session, token: str) -> tuple[bool, str]:
+    """
+    Verify a persistent refresh token and return (valid, user_id)
+    """
+    try:
+        from models import PersistentRefreshToken
+        
+        # Get all active persistent tokens
+        persistent_tokens = db.query(PersistentRefreshToken).filter(
+            PersistentRefreshToken.is_active == True,
+            PersistentRefreshToken.expires_at > datetime.utcnow()
+        ).all()
+        
+        # Find the token with matching hash
+        for persistent_token in persistent_tokens:
+            if verify_hashed_token(token, persistent_token.token_hash):
+                # Update last used timestamp
+                persistent_token.last_used = datetime.utcnow()
+                db.commit()
+                return True, str(persistent_token.user_id)
+        
+        return False, ""
+        
+    except Exception as e:
+        print(f"Error verifying persistent refresh token: {e}")
+        return False, ""
+
+def revoke_persistent_refresh_tokens(db: Session, user_id: str) -> int:
+    """
+    Revoke all persistent refresh tokens for a user
+    Returns: number of tokens revoked
+    """
+    try:
+        from models import PersistentRefreshToken
+        
+        # Get count before revoking
+        count = db.query(PersistentRefreshToken).filter(
+            PersistentRefreshToken.user_id == user_id,
+            PersistentRefreshToken.is_active == True
+        ).count()
+        
+        if count > 0:
+            db.query(PersistentRefreshToken).filter(
+                PersistentRefreshToken.user_id == user_id,
+                PersistentRefreshToken.is_active == True
+            ).update({"is_active": False})
+            
+            db.commit()
+            print(f"DEBUG: Revoked {count} persistent refresh tokens for user {user_id}")
+        
+        return count
+        
+    except Exception as e:
+        print(f"Error revoking persistent refresh tokens: {e}")
+        db.rollback()
+        return 0
+
+def cleanup_expired_persistent_tokens(db: Session) -> int:
+    """
+    Clean up expired persistent tokens
+    """
+    try:
+        from models import PersistentRefreshToken
+        
+        deleted_count = db.query(PersistentRefreshToken).filter(
+            PersistentRefreshToken.expires_at < datetime.utcnow()
+        ).delete()
+        
+        db.commit()
+        return deleted_count
+        
+    except Exception as e:
+        print(f"Error cleaning up expired persistent tokens: {e}")
+        db.rollback()
+        return 0
 

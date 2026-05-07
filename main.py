@@ -1,5 +1,7 @@
 # FastAPI Authentication Server
 import json
+import jwt
+import os
 from pydantic import BaseModel
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,14 +21,17 @@ from database import get_db
 from models import User, RefreshToken, UserLog, Category, IPAddressBlocked
 from security import (
     check_ip_block, block_ip_address, get_delay_for_failed_attempts, 
-    format_duration_ms, get_client_ip
+    format_duration_ms, get_client_ip, get_or_create_persistent_refresh_token,
+    create_persistent_refresh_token, store_persistent_refresh_token, create_refresh_token, hash_password, 
+    verify_password, create_access_token, get_current_user, require_role, 
+    log_user_action, revoke_all_user_tokens, revoke_persistent_refresh_tokens, decrypt_password, 
+    verify_persistent_refresh_token, hash_token, verify_hashed_token
 )
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # Configure timezone for Moldova
 MOLDOVA_TZ = ZoneInfo("Europe/Chisinau")
-from security import create_refresh_token, hash_password, verify_password, create_access_token, get_current_user, require_role, log_user_action, revoke_all_user_tokens, decrypt_password
 
 # Custom login form to avoid OAuth2PasswordRequestForm issues
 class LoginForm(BaseModel):
@@ -46,7 +51,7 @@ app = FastAPI(title="FastAPI Auth Server v4 - FIXED")
 def root():
     return {"message": "FastAPI Auth Server is running", "docs": "/docs", "redoc": "/redoc"}
 
-origins = ["http://localhost:8081", "http://192.168.0.15:8081", "http://127.0.0.1:8081", "http://10.22.242.11:8081", "*"]
+origins = ["http://localhost:8081", "http://127.0.0.1:8081",  "*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -132,26 +137,26 @@ def auth(request: Request, form_data: LoginForm, db: Session = Depends(get_db)):
     if is_blocked:
         ip_address = get_client_ip(request)
         raise HTTPException(
-            status_code=429, 
+            status_code=429,
             detail=f"Adresa IP {ip_address} este blocată. Încearcă din nou după {ip_block.expires_at}"
         )
-    
+
     user = db.query(User).filter(User.username == form_data.username).first()
-    
+
     if not user or not verify_password(form_data.password, user.password_hash):
         # Get IP address for tracking failed attempts
         ip_address = get_client_ip(request)
-        
+
         # Check existing failed attempts for this IP
         recent_failed_logs = db.query(UserLog).filter(
             UserLog.ip_address == ip_address,
             UserLog.action == "login_failed",
             UserLog.created_at >= datetime.utcnow() - timedelta(hours=1)
         ).count()
-        
+
         failed_attempts = recent_failed_logs + 1
         delay = get_delay_for_failed_attempts(failed_attempts)
-        
+
         # Log failed login attempt
         if user:
             log_user_action(
@@ -169,7 +174,7 @@ def auth(request: Request, form_data: LoginForm, db: Session = Depends(get_db)):
                 details=f"Failed login attempt: username {form_data.username} not found (attempt {failed_attempts})",
                 db=db
             )
-        
+
         # Block IP if threshold reached
         if delay > 0:
             block_ip_address(
@@ -179,26 +184,27 @@ def auth(request: Request, form_data: LoginForm, db: Session = Depends(get_db)):
                 failed_attempts=failed_attempts,
                 db=db
             )
-            
+
             if delay == float('inf'):
-                raise HTTPException(
-                    status_code=429,
-                    detail=f"Prea multe încercări eșuate. Adresa IP {ip_address} blocată permanent."
-                )
+                raise HTTPException( status_code=429, detail=f"Prea multe încercări eșuate. Adresa IP {ip_address} blocată permanent.")
             else:
-                raise HTTPException(
-                    status_code=429,
-                    detail=f"Prea multe încercări eșuate. Adresa IP {ip_address} blocată pentru {format_duration_ms(delay).replace('seconds', 'secunde').replace('minutes', 'minute').replace('hours', 'ore')}."
-                )
-        
+                raise HTTPException( status_code=429,detail=f"Prea multe încercări eșuate. Adresa IP {ip_address} blocată pentru {format_duration_ms(delay).replace('seconds', 'secunde').replace('minutes', 'minute').replace('hours', 'ore')}.")
+
         raise HTTPException(status_code=401, detail="Credențiale invalide")
-    
+
     token_access = create_access_token({"sub": str(user.id), "role": user.role, "username": user.username })
     token_refresh = create_refresh_token({"sub": str(user.id)})
-    new_refresh = RefreshToken(token = token_refresh, user_id = user.id, expires_at = datetime.utcnow() + timedelta(days=7))
+
+    # Extract JTI from token for tracking
+    token_payload = jwt.decode(token_refresh, os.getenv("JWT_SECRET_KEY"), algorithms=["HS256"])
+    token_jti = token_payload.get("jti")
+
+    # Store hashed token for security
+    token_hash = hash_token(token_refresh)
+    new_refresh = RefreshToken( token_hash = token_hash, token_jti = token_jti, user_id = user.id, expires_at = datetime.utcnow() + timedelta(days=7))
     db.add(new_refresh)
     db.commit()
-    
+
     # Log successful login
     log_user_action(
         user_id=str(user.id),
@@ -207,7 +213,6 @@ def auth(request: Request, form_data: LoginForm, db: Session = Depends(get_db)):
         details=f"User {user.username} logged in successfully with password",
         db=db
     )
-    
     return {
         "access_token": token_access,
         "refresh_token": token_refresh,
@@ -227,7 +232,7 @@ def biometric_auth(request: Request, form_data: BiometricAuthForm, db: Session =
         # Log failed biometric attempt
         log_user_action(
             user_id=None,
-            action="login_biometric_failed",
+            action="bio_login_failed",
             request=request,
             details=f"Failed biometric login attempt: username {form_data.username} not found",
             db=db
@@ -264,36 +269,35 @@ def biometric_verify(request: Request, form_data: LoginForm, db: Session = Depen
     """
     user = db.query(User).filter(User.username == form_data.username).first()
     if not user or not verify_password(form_data.password, user.password_hash):
-        # Log failed biometric verification
         if user:
-            log_user_action(
-                user_id=str(user.id),
-                action="login_biometric_failed",
-                request=request,
-                details=f"Failed biometric verification for user {user.username}: invalid decrypted password",
-                db=db
-            )
+            log_user_action( user_id=str(user.id), action="bio_login_failed", request=request,
+            details=f"Failed biometric verification for user {user.username}: invalid decrypted password", db=db)
         else:
-            log_user_action(
-                user_id=None,
-                action="login_biometric_failed",
-                request=request,
-                details=f"Failed biometric verification: username {form_data.username} not found",
-                db=db
-            )
+            log_user_action(user_id=None, action="bio_login_failed", request=request,
+                details=f"Failed biometric verification: username {form_data.username} not found", db=db)
         raise HTTPException(status_code=401, detail="Verificare biometrică eșuată")
     
-    # Generează token-uri pentru sesiune
     token_access = create_access_token({"sub": str(user.id), "role": user.role, "username": user.username })
     token_refresh = create_refresh_token({"sub": str(user.id)})
-    new_refresh = RefreshToken(token = token_refresh, user_id = user.id, expires_at = datetime.utcnow() + timedelta(days=7))
+    
+    token_payload = jwt.decode(token_refresh, os.getenv("JWT_SECRET_KEY"), algorithms=["HS256"])
+    token_jti = token_payload.get("jti")
+    
+    # Store hashed token for security
+    token_hash = hash_token(token_refresh)
+    new_refresh = RefreshToken(
+        token_hash = token_hash, 
+        token_jti = token_jti,
+        user_id = user.id, 
+        expires_at = datetime.utcnow() + timedelta(days=7)
+    )
     db.add(new_refresh)
     db.commit()
     
     # Log successful biometric login
     log_user_action(
         user_id=str(user.id),
-        action="login_biometric_success",
+        action="bio_login",
         request=request,
         details=f"User {user.username} successfully authenticated with biometric AES keys",
         db=db
@@ -305,6 +309,126 @@ def biometric_verify(request: Request, form_data: LoginForm, db: Session = Depen
         "token_type": "bearer",
         "expires_in": 3600,
         "login_method": "biometric_aes"
+    }
+
+@app.post("/auth/biometric/direct")
+def direct_biometric_auth(request: Request, form_data: LoginForm, db: Session = Depends(get_db)):
+    """
+    Endpoint pentru autentificare directă biometrică.
+    Clientul trimite username-ul și parola decriptată biometric.
+    Acest endpoint permite autentificarea fără a fi nevoie de login cu parola înainte.
+    """
+    # Verifică dacă IP este blocat
+    is_blocked, ip_block = check_ip_block(request, db)
+    if is_blocked:
+        ip_address = get_client_ip(request)
+        raise HTTPException(
+            status_code=429,
+            detail=f"Adresa IP {ip_address} este blocată. Încearcă din nou după {ip_block.expires_at}"
+        )
+
+    user = db.query(User).filter(User.username == form_data.username).first()
+    if not user:
+        log_user_action(
+            user_id=None,
+            action="bio_login_failed",
+            request=request,
+            details=f"Failed direct biometric login: username {form_data.username} not found",
+            db=db
+        )
+        raise HTTPException(status_code=401, detail="Utilizator negăsit")
+
+    # Verifică parola decriptată biometric
+    if not verify_password(form_data.password, user.password_hash):
+        # Get IP address for tracking failed attempts
+        ip_address = get_client_ip(request)
+
+        # Check existing failed attempts for this IP
+        recent_failed_logs = db.query(UserLog).filter(
+            UserLog.ip_address == ip_address,
+            UserLog.action == "bio_login_failed",
+            UserLog.created_at >= datetime.utcnow() - timedelta(hours=1)
+        ).count()
+
+        failed_attempts = recent_failed_logs + 1
+        delay = get_delay_for_failed_attempts(failed_attempts)
+
+        # Log failed biometric attempt
+        log_user_action(
+            user_id=str(user.id),
+            action="bio_login_failed",
+            request=request,
+            details=f"Failed direct biometric login for user {user.username}: invalid decrypted password (attempt {failed_attempts})",
+            db=db
+        )
+
+        # Block IP if threshold reached
+        if delay > 0:
+            block_ip_address(
+                ip_address=ip_address,
+                block_duration=delay,
+                username=form_data.username,
+                failed_attempts=failed_attempts,
+                db=db
+            )
+
+            if delay == float('inf'):
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Prea multe încercări eșuate. Adresa IP {ip_address} blocată permanent."
+                )
+            else:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Prea multe încercări eșuate. Adresa IP {ip_address} blocată pentru {format_duration_ms(delay).replace('seconds', 'secunde').replace('minutes', 'minute').replace('hours', 'ore')}."
+                )
+
+        raise HTTPException(status_code=401, detail="Autentificare biometrică eșuată")
+
+    # Generează token-uri
+    token_access = create_access_token({"sub": str(user.id), "role": user.role, "username": user.username})
+
+    # Obține sau creează persistent refresh token pentru biometric (30 zile)
+    # Reutilizează token-ul existent dacă este încă valid
+    persistent_token, persistent_token_hash = get_or_create_persistent_refresh_token(
+        db, str(user.id)
+    )
+    print(f"DEBUG: Persistent token for user {user.id}: {persistent_token[:20]}...")
+
+    # Creează și refresh token standard (7 zile)
+    token_refresh = create_refresh_token({"sub": str(user.id)})
+
+    # Extract JTI from token for tracking
+    token_payload = jwt.decode(token_refresh, os.getenv("JWT_SECRET_KEY"), algorithms=["HS256"])
+    token_jti = token_payload.get("jti")
+
+    # Store hashed token for security
+    token_hash = hash_token(token_refresh)
+    new_refresh = RefreshToken(
+        token_hash = token_hash,
+        token_jti = token_jti,
+        user_id = user.id,
+        expires_at = datetime.utcnow() + timedelta(days=7)
+    )
+    db.add(new_refresh)
+    db.commit()
+
+    # Log successful biometric login
+    log_user_action(
+        user_id=str(user.id),
+        action="bio_login",
+        request=request,
+        details=f"User {user.username} successfully authenticated with direct biometric",
+        db=db
+    )
+
+    return {
+        "access_token": token_access,
+        "refresh_token": token_refresh,
+        "persistent_refresh_token": persistent_token,
+        "token_type": "bearer",
+        "expires_in": 3600,
+        "login_method": "biometric_direct"
     }
 
 
@@ -651,7 +775,7 @@ def handle_legacy_bio_auth(request: Request, form_data: LoginForm, db: Session):
         # Log failed attempt
         log_user_action(
             user_id=str(user.id) if user else None,
-            action="bio_login_failed",
+            action="login_password_failed",
             request=request,
             details=f"Failed login attempt for user {form_data.username}",
             db=db
@@ -661,12 +785,24 @@ def handle_legacy_bio_auth(request: Request, form_data: LoginForm, db: Session):
     # Generate tokens
     token_access = create_access_token({"sub": str(user.id), "role": user.role, "username": user.username})
     token_refresh = create_refresh_token({"sub": str(user.id)})
-    db.add(RefreshToken(token=token_refresh, user_id=user.id, expires_at=datetime.utcnow() + timedelta(days=7)))
+    
+    # Extract JTI from token for tracking
+    token_payload = jwt.decode(token_refresh, os.getenv("JWT_SECRET_KEY"), algorithms=["HS256"])
+    token_jti = token_payload.get("jti")
+    
+    # Store hashed token for security
+    token_hash = hash_token(token_refresh)
+    db.add(RefreshToken(
+        token_hash = token_hash, 
+        token_jti = token_jti,
+        user_id = user.id, 
+        expires_at = datetime.utcnow() + timedelta(days=7)
+    ))
     db.commit()
 
     log_user_action(
         user_id=str(user.id),
-        action="bio_login",
+        action="login_password",
         request=request,
         details=f"User {user.username} logged in via password",
         db=db
@@ -681,39 +817,119 @@ def test_endpoint():
     """
     return {"message": "Backend is reachable", "timestamp": datetime.utcnow().isoformat()}
 
+@app.post("/auth/refresh")
+def refresh_token(request: Request, refresh_token: str = None, persistent_refresh_token: str = None, db: Session = Depends(get_db)):
+    """
+    Refresh access token using either regular refresh token or persistent refresh token
+    """
+    try:
+        user_id = None
+        
+        # Try persistent refresh token first (for biometric login)
+        if persistent_refresh_token:
+            is_valid, user_id = verify_persistent_refresh_token(db, persistent_refresh_token)
+            if is_valid:
+                user = db.query(User).filter(User.id == user_id).first()
+                if user:
+                    # Generate new access token
+                    token_access = create_access_token({
+                        "sub": str(user.id), 
+                        "role": user.role, 
+                        "username": user.username
+                    })
+                    
+                    log_user_action(
+                        user_id=str(user.id),
+                        action="token_refreshed_persistent",
+                        request=request,
+                        details="Access token refreshed using persistent refresh token",
+                        db=db
+                    )
+                    
+                    return {
+                        "access_token": token_access,
+                        "token_type": "bearer",
+                        "expires_in": 3600,
+                        "refresh_method": "persistent"
+                    }
+        
+        # Fall back to regular refresh token
+        if refresh_token:
+            # Get all refresh tokens for this user and verify hash
+            all_tokens = db.query(RefreshToken).filter(
+                RefreshToken.expires_at > datetime.utcnow()
+            ).all()
+            
+            # Find the token with matching hash
+            token_record = None
+            for token in all_tokens:
+                if verify_hashed_token(refresh_token, token.token_hash):
+                    token_record = token
+                    break
+            
+            if token_record:
+                user = db.query(User).filter(User.id == token_record.user_id).first()
+                if user:
+                    # Generate new access token
+                    token_access = create_access_token({
+                        "sub": str(user.id), 
+                        "role": user.role, 
+                        "username": user.username
+                    })
+                    
+                    log_user_action(
+                        user_id=str(user.id),
+                        action="token_refreshed",
+                        request=request,
+                        details="Access token refreshed using regular refresh token",
+                        db=db
+                    )
+                    
+                    return {
+                        "access_token": token_access,
+                        "token_type": "bearer",
+                        "expires_in": 3600,
+                        "refresh_method": "regular"
+                    }
+        
+        raise HTTPException(status_code=401, detail="Refresh token invalid sau expirat")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error refreshing token: {e}")
+        raise HTTPException(status_code=500, detail="Eroare internă la refresh token")
+
 @app.post("/logout")
 def logout(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """
-    Logout user and log the action
-    """
     try:
         print(f"Logout attempt for user: {current_user.username} (ID: {current_user.id})")
         
-        # Revoke all user tokens
+        # Revoke all regular refresh tokens (not persistent ones)
         revoked_count = revoke_all_user_tokens(db, str(current_user.id))
-        print(f"Revoked {revoked_count} tokens for user {current_user.username}")
+        print(f"Revoked {revoked_count} regular refresh tokens for user {current_user.username}")
+        
+        # NOTE: Persistent refresh tokens are NOT revoked on logout
+        # They remain valid for 30 days for biometric authentication
+        # They are only revoked when biometric auth is disabled
         
         # Log logout action
         log_user_action(
             user_id=str(current_user.id),
             action="logout",
             request=request,
-            details=f"User {current_user.username} logged out successfully. Revoked {revoked_count} tokens.",
-            db=db
-        )
-        
+            details=f"User {current_user.username} logged out successfully. Revoked {revoked_count} regular tokens. Persistent tokens remain active for biometric auth.",
+            db=db)
         return {"message": "Logout successful", "revoked_tokens": revoked_count}
     except Exception as e:
         print(f"ERROR during logout: {str(e)}")
-        # Log error but still return success
         try:
             log_user_action(
                 user_id=str(current_user.id),
                 action="logout",
                 request=request,
                 details=f"User {current_user.username} logged out with error: {str(e)}",
-                db=db
-            )
+                db=db)
         except Exception as log_error:
             print(f"ERROR logging logout action: {str(log_error)}")
         
@@ -783,6 +999,9 @@ def log_user_event(request: Request, log_data: dict, db: Session = Depends(get_d
                 details_message = f"User {username} enabled biometric authentication using {bio_method}"
             else:
                 details_message = f"User {username} disabled biometric authentication"
+                # Revoke persistent refresh tokens when biometric auth is disabled
+                revoked = revoke_persistent_refresh_tokens(db, str(user.id))
+                print(f"Revoked {revoked} persistent refresh tokens for user {username} (biometric auth disabled)")
             
             log_user_action(
                 user_id=user.id,

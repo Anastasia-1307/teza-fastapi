@@ -1,7 +1,7 @@
 from sqlalchemy import Column, String, DateTime, Text, ForeignKey, Integer, Boolean
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import UUID
-from datetime import datetime
+from datetime import datetime, timedelta
 from database import Base
 import uuid
 
@@ -17,6 +17,7 @@ class User(Base):
     refresh_tokens = relationship("RefreshToken", back_populates="user")
     categories = relationship("Category", back_populates="user")
     user_logs = relationship("UserLog", back_populates="user")
+    persistent_refresh_tokens = relationship("PersistentRefreshToken", back_populates="user")
 
 class Category(Base):
     __tablename__ = "categories"
@@ -44,7 +45,8 @@ class Password(Base):
 class RefreshToken(Base):
     __tablename__ = "refresh_tokens"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    token = Column(String, unique=True, nullable=False)
+    token_hash = Column(String, unique=True, nullable=False)  # Hashed refresh token for security
+    token_jti = Column(String, unique=True, nullable=False)  # JWT ID for blacklisting
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
     user = relationship("User", back_populates="refresh_tokens")
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -75,6 +77,17 @@ class IPAddressBlocked(Base):
     blocked_at = Column(DateTime, default=datetime.utcnow)
     block_duration = Column(Integer, nullable=False)  # Duration in milliseconds
     is_active = Column(Boolean, default=True)
-    username = Column(String(50))  # Username that triggered the block
+    username = Column(String(50))  # Username that triggered block
     failed_attempts = Column(Integer, default=1)
-    expires_at = Column(DateTime)  # When the block expires
+    expires_at = Column(DateTime)  # When block expires
+
+class PersistentRefreshToken(Base):
+    __tablename__ = "persistent_refresh_tokens"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    token_hash = Column(String, nullable=False)  # Hashed refresh token for security
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_used = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False, default=datetime.utcnow() + timedelta(days=30))  # 30 days from creation
+    is_active = Column(Boolean, default=True)
+    user = relationship("User", back_populates="persistent_refresh_tokens")
