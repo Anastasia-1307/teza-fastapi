@@ -70,7 +70,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     print(f"Token validated for user {user_data['user_id']} at {datetime.utcnow()}")
     user = db.query(User).filter(User.id == user_data["user_id"]).first()
     if not user:
-        raise HTTPException(status_code=401, detail="Utilizator negãsit")
+        raise HTTPException(status_code=401, detail="Utilizator negăsit")
     
     return user
 
@@ -560,7 +560,7 @@ def log_user_action(user_id: str, action: str, request: Request = None, details:
                 ip_address = request.client.host if request.client else None
             user_agent = request.headers.get("User-Agent")
         
-        moldova_time = datetime.now(MOLDOVA_TZ)
+        utc_time = datetime.utcnow()
         
         user_log = UserLog(
             user_id=user_id,
@@ -568,11 +568,11 @@ def log_user_action(user_id: str, action: str, request: Request = None, details:
             ip_address=ip_address,
             user_agent=user_agent,
             details=details,
-            created_at=moldova_time )
+            created_at=utc_time)
         
         db.add(user_log)
         db.commit()
-        print(f"SUCCESS: Logged action '{action}' for user {user_id} at {moldova_time}")
+        print(f"SUCCESS: Logged action '{action}' for user {user_id} at {utc_time}")
         
     except Exception as e:
         print(f"ERROR: Failed to log user action: {str(e)}")

@@ -87,9 +87,9 @@ async def ip_block_middleware(request: Request, call_next):
             return JSONResponse(
                 status_code=429,
                 content={
-                    "detail": f"Adresa IP {ip_address} este blocată. Încearcă din nou peste {ip_block.expires_at}",
+                    "detail": f"Adresa IP {ip_address} este blocată. Încearcă din nou peste {ip_block.expires_at.replace(tzinfo=ZoneInfo('UTC')).astimezone(MOLDOVA_TZ) if ip_block.expires_at else ip_block.expires_at}",
                     "error_code": "IP_BLOCKED",
-                    "block_expires_at": ip_block.expires_at.isoformat() if ip_block.expires_at else None
+                    "block_expires_at": ip_block.expires_at.replace(tzinfo=ZoneInfo('UTC')).astimezone(MOLDOVA_TZ).isoformat() if ip_block.expires_at else None
                 }
             )
         
@@ -127,7 +127,7 @@ def register(user: Register, request: Request, db: Session = Depends(get_db)):
         "id": str(new_user.id),
         "username": new_user.username,
         "role": new_user.role,
-        "created_at": new_user.created_at
+        "created_at": new_user.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if new_user.created_at else new_user.created_at
     }
 
 @app.post("/auth")
@@ -138,7 +138,8 @@ def auth(request: Request, form_data: LoginForm, db: Session = Depends(get_db)):
         ip_address = get_client_ip(request)
         raise HTTPException(
             status_code=429,
-            detail=f"Adresa IP {ip_address} este blocată. Încearcă din nou după {ip_block.expires_at}"
+            detail=f"Adresa IP {ip_address} este blocată. Încearcă din nou după {ip_block.expires_at.replace(tzinfo=ZoneInfo('UTC')).astimezone(MOLDOVA_TZ) 
+            if ip_block.expires_at else ip_block.expires_at}"
         )
 
     user = db.query(User).filter(User.username == form_data.username).first()
@@ -324,7 +325,7 @@ def direct_biometric_auth(request: Request, form_data: LoginForm, db: Session = 
         ip_address = get_client_ip(request)
         raise HTTPException(
             status_code=429,
-            detail=f"Adresa IP {ip_address} este blocată. Încearcă din nou după {ip_block.expires_at}"
+            detail=f"Adresa IP {ip_address} este blocată. Încearcă din nou după {ip_block.expires_at.replace(tzinfo=ZoneInfo('UTC')).astimezone(MOLDOVA_TZ) if ip_block.expires_at else ip_block.expires_at}"
         )
 
     user = db.query(User).filter(User.username == form_data.username).first()
@@ -488,8 +489,8 @@ def add_password(password_data: PasswordCreate, request: Request, current_user: 
             "login": new_password.login,
             "password_encrypted": new_password.password_encrypted,
             "description": new_password.description,
-            "created_at": new_password.created_at,
-            "updated_at": new_password.updated_at,
+            "created_at": new_password.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if new_password.created_at else new_password.created_at,
+            "updated_at": new_password.updated_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if new_password.updated_at else new_password.updated_at,
             "user_id": str(new_password.user_id),
             "category_id": str(new_password.category_id) if new_password.category_id else None
         }
@@ -515,8 +516,8 @@ def get_passwords(current_user: User = Depends(get_current_user), db: Session = 
                 "login": password.login,
                 "password_encrypted": password.password_encrypted,
                 "description": password.description,
-                "created_at": password.created_at,
-                "updated_at": password.updated_at,
+                "created_at": password.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if password.created_at else password.created_at,
+                "updated_at": password.updated_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if password.updated_at else password.updated_at,
                 "user_id": str(password.user_id),
                 "category_id": str(password.category_id) if password.category_id else None,
                 "category_name": db.query(Category).filter(Category.id == password.category_id).first().name if password.category_id else None
@@ -547,8 +548,8 @@ def get_password(password_id: str, current_user: User = Depends(get_current_user
             "login": password.login,
             "password": decrypted_password,
             "description": password.description,
-            "created_at": password.created_at,
-            "updated_at": password.updated_at,
+            "created_at": password.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if password.created_at else password.created_at,
+            "updated_at": password.updated_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if password.updated_at else password.updated_at,
             "user_id": str(password.user_id),
             "category_id": str(password.category_id) if password.category_id else None
         }
@@ -605,8 +606,8 @@ def update_password_endpoint(password_id: str, password_data: PasswordUpdate, re
             "login": updated_password.login,
             "password_encrypted": updated_password.password_encrypted,
             "description": updated_password.description,
-            "created_at": updated_password.created_at,
-            "updated_at": updated_password.updated_at,
+            "created_at": updated_password.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if updated_password.created_at else updated_password.created_at,
+            "updated_at": updated_password.updated_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if updated_password.updated_at else updated_password.updated_at,
             "user_id": str(updated_password.user_id),
             "category_id": str(updated_password.category_id) if updated_password.category_id else None
         }
@@ -1035,7 +1036,7 @@ def get_all_users(current_user: User = Depends(require_role("admin")), db: Sessi
             "id": str(user.id),
             "username": user.username,
             "role": user.role,
-            "created_at": user.created_at
+            "created_at": user.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if user.created_at else user.created_at
         }
         for user in users
     ]
@@ -1138,7 +1139,7 @@ def get_user_logs(current_user: User = Depends(require_role("admin")), db: Sessi
             "ip_address": log.ip_address,
             "user_agent": log.user_agent,
             "details": log.details,
-            "created_at": log.created_at
+            "created_at": log.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if log.created_at else log.created_at
         }
         for log in logs
     ]
@@ -1160,12 +1161,12 @@ def get_ip_blocks(
         {
             "id": str(block.id),
             "ip_address": block.ip_address,
-            "blocked_at": block.blocked_at,
+            "blocked_at": block.blocked_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if block.blocked_at else block.blocked_at,
             "block_duration": block.block_duration,
             "is_active": block.is_active,
             "username": block.username,
             "failed_attempts": block.failed_attempts,
-            "expires_at": block.expires_at,
+            "expires_at": block.expires_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if block.expires_at else block.expires_at,
             "user_id": str(block.user_id) if block.user_id else None
         }
         for block in ip_blocks
@@ -1210,12 +1211,12 @@ def create_ip_block_admin(
         return {
             "id": str(ip_block.id),
             "ip_address": ip_block.ip_address,
-            "blocked_at": ip_block.blocked_at,
+            "blocked_at": ip_block.blocked_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if ip_block.blocked_at else ip_block.blocked_at,
             "block_duration": ip_block.block_duration,
             "is_active": ip_block.is_active,
             "username": ip_block.username,
             "failed_attempts": ip_block.failed_attempts,
-            "expires_at": ip_block.expires_at,
+            "expires_at": ip_block.expires_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if ip_block.expires_at else ip_block.expires_at,
             "user_id": str(ip_block.user_id) if ip_block.user_id else None
         }
     
@@ -1253,12 +1254,12 @@ def update_ip_block_admin(
         return {
             "id": str(ip_block.id),
             "ip_address": ip_block.ip_address,
-            "blocked_at": ip_block.blocked_at,
+            "blocked_at": ip_block.blocked_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if ip_block.blocked_at else ip_block.blocked_at,
             "block_duration": ip_block.block_duration,
             "is_active": ip_block.is_active,
             "username": ip_block.username,
             "failed_attempts": ip_block.failed_attempts,
-            "expires_at": ip_block.expires_at,
+            "expires_at": ip_block.expires_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if ip_block.expires_at else ip_block.expires_at,
             "user_id": str(ip_block.user_id) if ip_block.user_id else None
         }
     
@@ -1346,9 +1347,9 @@ def check_ip_address(
                 "is_blocked": True,
                 "block_details": {
                     "id": str(ip_block.id),
-                    "blocked_at": ip_block.blocked_at,
+                    "blocked_at": ip_block.blocked_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if ip_block.blocked_at else ip_block.blocked_at,
                     "block_duration": ip_block.block_duration,
-                    "expires_at": ip_block.expires_at,
+                    "expires_at": ip_block.expires_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if ip_block.expires_at else ip_block.expires_at,
                     "username": ip_block.username,
                     "failed_attempts": ip_block.failed_attempts
                 }
