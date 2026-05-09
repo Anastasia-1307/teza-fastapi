@@ -205,21 +205,27 @@ def auth(request: Request, form_data: LoginForm, db: Session = Depends(get_db)):
     new_refresh = RefreshToken( token_hash = token_hash, token_jti = token_jti, user_id = user.id, expires_at = datetime.utcnow() + timedelta(days=7))
     db.add(new_refresh)
     db.commit()
-
-    # Log successful login
-    log_user_action(
-        user_id=str(user.id),
-        action="login",
-        request=request,
-        details=f"User {user.username} logged in successfully with password",
-        db=db
-    )
-    return {
+    log_user_action(user_id=str(user.id), action="login", request=request, details=f"User {user.username} logged in successfully with password",
+    db=db)
+    
+    persistent_token = None
+    if user.role != 'admin':
+        persistent_token, persistent_token_hash = get_or_create_persistent_refresh_token(
+            db, str(user.id)
+        )
+        print(f"DEBUG: Persistent token created for user {user.id}: {persistent_token[:20] if persistent_token else None}...")
+    
+    response_data = {
         "access_token": token_access,
         "refresh_token": token_refresh,
         "token_type": "bearer",
         "expires_in": 3600
     }
+    
+    if persistent_token:
+        response_data["persistent_refresh_token"] = persistent_token
+    
+    return response_data
 
 @app.post("/auth/biometric")
 def biometric_auth(request: Request, form_data: BiometricAuthForm, db: Session = Depends(get_db)):
@@ -818,6 +824,39 @@ def test_endpoint():
     """
     return {"message": "Backend is reachable", "timestamp": datetime.utcnow().isoformat()}
 
+@app.get("/auth/biometric/status/{username}")
+def check_biometric_status(username: str, db: Session = Depends(get_db)):
+    """
+    Check if biometric authentication is available for a user
+    Verifies both local data availability and persistent token status
+    """
+    try:
+        # Check if user exists
+        user = db.query(User).filter(User.username == username).first()
+        if not user:
+            return {"biometric_available": False, "reason": "user_not_found"}
+        
+        # Check if user has active persistent refresh token
+        from models import PersistentRefreshToken
+        persistent_token = db.query(PersistentRefreshToken).filter(
+            PersistentRefreshToken.user_id == user.id,  # user.id is already UUID
+            PersistentRefreshToken.is_active == True,
+            PersistentRefreshToken.expires_at > datetime.utcnow()
+        ).first()
+        
+        if not persistent_token:
+            return {"biometric_available": False, "reason": "no_active_persistent_token"}
+        
+        return {
+            "biometric_available": True,
+            "username": username,
+            "token_expires_at": persistent_token.expires_at.isoformat()
+        }
+        
+    except Exception as e:
+        print(f"Error checking biometric status: {e}")
+        return {"biometric_available": False, "reason": "server_error"}
+
 @app.post("/auth/refresh")
 def refresh_token(request: Request, refresh_token: str = None, persistent_refresh_token: str = None, db: Session = Depends(get_db)):
     """
@@ -1069,6 +1108,10 @@ def update_user_role(user_id: str, role_data: dict, request: Request, current_us
         user.role = new_role
         db.commit()
         
+        # Revoke all user tokens to force re-login with new role
+        revoked_count = revoke_all_user_tokens(db, str(user.id))
+        print(f"Revoked {revoked_count} tokens for user {user.username} after role change")
+        
         # Log role change action
         log_user_action(
             user_id=str(current_user.id),
@@ -1078,7 +1121,7 @@ def update_user_role(user_id: str, role_data: dict, request: Request, current_us
             db=db
         )
         
-        return {"message": f"Rolul utilizatorului {user.username} a fost actualizat la {new_role}"}
+        return {"message": f"Rolul utilizatorului {user.username} a fost actualizat la {new_role}. Utilizatorul trebuie să se autentifice din nou."}
     except HTTPException:
         raise
     except Exception as e:
@@ -1106,6 +1149,11 @@ def delete_user(user_id: str, request: Request, current_user: User = Depends(req
                 raise HTTPException(status_code=403, detail="Nu poți șterge ultimul admin")
         
         username = user.username
+        
+        # Revoke all user tokens before deletion
+        revoked_count = revoke_all_user_tokens(db, str(user.id))
+        print(f"Revoked {revoked_count} tokens for user {username} before deletion")
+        
         db.delete(user)
         db.commit()
         
@@ -1166,8 +1214,7 @@ def get_ip_blocks(
             "is_active": block.is_active,
             "username": block.username,
             "failed_attempts": block.failed_attempts,
-            "expires_at": block.expires_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if block.expires_at else block.expires_at,
-            "user_id": str(block.user_id) if block.user_id else None
+            "expires_at": block.expires_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if block.expires_at else block.expires_at
         }
         for block in ip_blocks
     ]

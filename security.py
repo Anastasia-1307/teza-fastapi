@@ -675,10 +675,20 @@ def get_or_create_persistent_refresh_token(db: Session, user_id: str) -> tuple[s
     """
     try:
         from models import PersistentRefreshToken
+        import uuid as uuid_module
+        
+        # Convert user_id string to UUID
+        try:
+            user_uuid = uuid_module.UUID(user_id)
+        except ValueError:
+            print(f"ERROR: Invalid user_id format: {user_id}")
+            # Fallback: create new token without storing
+            new_token, new_token_hash = create_persistent_refresh_token(user_id)
+            return new_token, new_token_hash
         
         # Check if user has an active, non-expired persistent token
         existing_token = db.query(PersistentRefreshToken).filter(
-            PersistentRefreshToken.user_id == user_id,
+            PersistentRefreshToken.user_id == user_uuid,
             PersistentRefreshToken.is_active == True,
             PersistentRefreshToken.expires_at > datetime.utcnow()
         ).first()
@@ -720,14 +730,22 @@ def store_persistent_refresh_token(db: Session, user_id: str, token_hash: str, d
     """
     try:
         from models import PersistentRefreshToken
+        import uuid as uuid_module
         
         print(f"DEBUG: Storing persistent refresh token for user {user_id}")
         print(f"DEBUG: Token hash (first 50 chars): {token_hash[:50]}...")
         
+        # Convert user_id string to UUID
+        try:
+            user_uuid = uuid_module.UUID(user_id)
+        except ValueError:
+            print(f"ERROR: Invalid user_id format: {user_id}")
+            return False
+        
         # Deactivate existing tokens for this user/device only if requested
         if deactivate_existing:
             existing_tokens = db.query(PersistentRefreshToken).filter(
-                PersistentRefreshToken.user_id == user_id,
+                PersistentRefreshToken.user_id == user_uuid,
                 PersistentRefreshToken.is_active == True
             ).all()
             
@@ -737,7 +755,7 @@ def store_persistent_refresh_token(db: Session, user_id: str, token_hash: str, d
         
         # Create new persistent token
         persistent_token = PersistentRefreshToken(
-            user_id=user_id,
+            user_id=user_uuid,
             token_hash=token_hash,
             expires_at=datetime.utcnow() + timedelta(days=30)
         )
@@ -786,16 +804,24 @@ def revoke_persistent_refresh_tokens(db: Session, user_id: str) -> int:
     """
     try:
         from models import PersistentRefreshToken
+        import uuid as uuid_module
+        
+        # Convert user_id string to UUID
+        try:
+            user_uuid = uuid_module.UUID(user_id)
+        except ValueError:
+            print(f"ERROR: Invalid user_id format: {user_id}")
+            return 0
         
         # Get count before revoking
         count = db.query(PersistentRefreshToken).filter(
-            PersistentRefreshToken.user_id == user_id,
+            PersistentRefreshToken.user_id == user_uuid,
             PersistentRefreshToken.is_active == True
         ).count()
         
         if count > 0:
             db.query(PersistentRefreshToken).filter(
-                PersistentRefreshToken.user_id == user_id,
+                PersistentRefreshToken.user_id == user_uuid,
                 PersistentRefreshToken.is_active == True
             ).update({"is_active": False})
             
