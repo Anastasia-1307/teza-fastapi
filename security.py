@@ -9,7 +9,7 @@ from cryptography.hazmat.backends import default_backend
 import os
 import hashlib
 import jwt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import uuid
 import string
 import re
@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from models import UserLog, IPAddressBlocked
 import os
 from dotenv import load_dotenv
-from models import User
+from models import User, PersistentRefreshToken, RefreshToken
 from database import get_db
 from zoneinfo import ZoneInfo
 
@@ -31,8 +31,8 @@ MOLDOVA_TZ = ZoneInfo("Europe/Chisinau")
 load_dotenv(".env.local")
 
 # Load secrets from environment variables
-secret_key = os.getenv("JWT_SECRET_KEY")
-if not secret_key:
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+if not JWT_SECRET_KEY:
     raise ValueError("JWT_SECRET_KEY environment variable is required")
 
 AES_KEY = os.getenv("AES_ENCRYPTION_KEY")
@@ -67,7 +67,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         print(f"Token validation failed - token: {token[:20]}...")
         raise HTTPException(status_code=401, detail="Token invalid sau expirat")
     
-    print(f"Token validated for user {user_data['user_id']} at {datetime.utcnow()}")
+    print(f"Token validated for user {user_data['user_id']} at {datetime.now(timezone.utc)}")
     user = db.query(User).filter(User.id == user_data["user_id"]).first()
     if not user:
         raise HTTPException(status_code=401, detail="Utilizator negăsit")
@@ -152,7 +152,8 @@ def generate_master_key() -> str:
     Returns:
         Base64 encoded master key
     """
-    return secrets.token_urlsafe(32)
+    master_key = secrets.token_bytes(32)  # 32 bytes = 256 bits
+    return base64.urlsafe_b64encode(master_key).decode('utf-8')
 
 def derive_key_from_master(master_key_b64: str, salt: bytes = None) -> Tuple[bytes, bytes]:
   
@@ -260,18 +261,18 @@ def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta]
     to_encode = data.copy()
     
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = datetime.now(timezone.utc) + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     
     to_encode.update({
         "exp": expire,
-        "iat": datetime.utcnow(),
+        "iat": datetime.now(timezone.utc),
         "type": "access"
     })
     
     print(f"Creating access token for user {data.get('sub', 'unknown')} that expires at {expire}")
-    encoded_jwt = jwt.encode(to_encode, secret_key, algorithm=ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
 def hash_token(token: str) -> str:
@@ -290,40 +291,66 @@ def verify_hashed_token(token: str, token_hash: str) -> bool:
     except VerifyMismatchError:
         return False
 
-def create_refresh_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
-  
+def create_refresh_token(
+    data: Dict[str, Any],
+    db: Session,
+    user_id: str,
+    expires_delta: Optional[timedelta] = None,
+    token_type: str = "refresh"
+) -> str:
+
     to_encode = data.copy()
-    
+
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = datetime.now(timezone.utc)+ expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    
+        expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+
+    jti = str(uuid.uuid4())
+
     to_encode.update({
         "exp": expire,
-        "iat": datetime.utcnow(),
-        "type": "refresh",
-        "jti": str(uuid.uuid4())  # Unique identifier for token
+        "iat": datetime.now(timezone.utc),
+        "type": token_type,
+        "jti": jti
     })
-    
-    encoded_jwt = jwt.encode(to_encode, secret_key, algorithm=ALGORITHM)
+
+    encoded_jwt = jwt.encode(
+        to_encode,
+        JWT_SECRET_KEY,
+        algorithm=ALGORITHM
+    )
+
+    # HASH refresh token
+    token_hash = ph.hash(encoded_jwt)
+
+    refresh_token_record = RefreshToken(
+        token_hash=token_hash,
+        token_jti=jti,
+        user_id=user_id,
+        expires_at=expire
+    )
+
+    db.add(refresh_token_record)
+    db.commit()
+
     return encoded_jwt
 
 def verify_token(token: str, token_type: str = "access") -> Optional[Dict[str, Any]]:
   
     try:
-        payload = jwt.decode(token, secret_key, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[ALGORITHM])
         
         # Check if token type matches
         if payload.get("type") != token_type:
             return None
             
         # Check if token is expired
-        if datetime.utcnow() > datetime.fromtimestamp(payload["exp"]):
+        if datetime.now(timezone.utc) > datetime.fromtimestamp(payload["exp"], tz=timezone.utc):
             return None
         
         # Check if token is blacklisted (only for refresh tokens)
-        if token_type == "refresh" and is_token_blacklisted(token):
+        if token_type == "refresh" and is_token_blacklisted_db(token):
             return None
             
         return payload
@@ -346,10 +373,14 @@ def extract_user_from_token(token: str) -> Optional[Dict[str, Any]]:
 def generate_token_pair(user_data: Dict[str, Any]) -> Dict[str, str]:
    
     access_token = create_access_token(user_data)
-    refresh_token = create_refresh_token({
+    refresh_token = create_refresh_token(
+    {
         "sub": user_data["user_id"],
         "username": user_data["username"]
-    })
+    },
+    db=db,
+    user_id=user_data["user_id"]
+)
     
     return {
         "access_token": access_token,
@@ -377,7 +408,7 @@ def blacklist_token_db(db: Session, token: str) -> bool:
         import models
         
         # Decode token to get jti and expiration
-        payload = jwt.decode(token, secret_key, algorithms=[ALGORITHM], options={"verify_signature": False})
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[ALGORITHM])
         jti = payload.get("jti")
         exp = payload.get("exp")
         
@@ -393,7 +424,7 @@ def blacklist_token_db(db: Session, token: str) -> bool:
         blacklisted_token = models.BlacklistedToken(
             jti=jti,
             expires_at=datetime.fromtimestamp(exp),
-            created_at=datetime.utcnow()
+            created_at=datetime.now(timezone.utc)
         )
         
         db.add(blacklisted_token)
@@ -408,7 +439,7 @@ def is_token_blacklisted_db(db: Session, token: str) -> bool:
     try:
         import models
         
-        payload = jwt.decode(token, secret_key, algorithms=[ALGORITHM], options={"verify_signature": False})
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[ALGORITHM], options={"verify_signature": False})
         jti = payload.get("jti")
         
         if not jti:
@@ -434,7 +465,7 @@ def cleanup_expired_tokens_db(db: Session) -> int:
         
         # Delete expired tokens
         deleted_count = db.query(models.BlacklistedToken).filter(
-            models.BlacklistedToken.expires_at < datetime.utcnow()
+            models.BlacklistedToken.expires_at < datetime.now(timezone.utc)
         ).delete()
         
         db.commit()
@@ -450,7 +481,7 @@ def revoke_all_user_tokens(db: Session, user_id: str) -> int:
         # Get all refresh tokens for user and blacklist them
         refresh_tokens = db.query(models.RefreshToken).filter(
             models.RefreshToken.user_id == user_id,
-            models.RefreshToken.expires_at > datetime.utcnow()).all()
+            models.RefreshToken.expires_at > datetime.now(timezone.utc)).all()
         revoked_count = 0
         for token in refresh_tokens:
             # Use the stored JTI instead of trying to decode hashed token
@@ -462,7 +493,7 @@ def revoke_all_user_tokens(db: Session, user_id: str) -> int:
                     blacklisted_token = models.BlacklistedToken(
                         jti=jti,
                         expires_at=token.expires_at,
-                        created_at=datetime.utcnow())
+                        created_at=datetime.now(timezone.utc))
                     db.add(blacklisted_token)
                     revoked_count += 1
         
@@ -483,7 +514,7 @@ def set_auth_cookies(response: Response, access_token: str, refresh_token: str) 
         key="access_token",
         value=access_token,
         max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,  # Convert to seconds
-        expires=datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+        expires=datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
         path="/",
         domain=None,
         secure=True,  # HTTPS only
@@ -496,7 +527,7 @@ def set_auth_cookies(response: Response, access_token: str, refresh_token: str) 
         key="refresh_token",
         value=refresh_token,
         max_age=REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,  # Convert to seconds
-        expires=datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+        expires=datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
         path="/",
         domain=None,
         secure=True,  # HTTPS only
@@ -560,7 +591,7 @@ def log_user_action(user_id: str, action: str, request: Request = None, details:
                 ip_address = request.client.host if request.client else None
             user_agent = request.headers.get("User-Agent")
         
-        utc_time = datetime.utcnow()
+        utc_time = datetime.now(timezone.utc)
         
         user_log = UserLog(
             user_id=user_id,
@@ -659,198 +690,352 @@ def format_duration_ms(ms: int) -> str:
         hours = seconds // 3600
         return f"{hours} hours" if hours != 1 else "1 hour"
 
-def create_persistent_refresh_token(user_id: str) -> tuple[str, str]:
-    """
-    Create a persistent refresh token that lasts 30 days
-    Returns: (token, token_hash)
-    """
-    token = create_refresh_token({"sub": user_id})
-    token_hash = hash_token(token)  # Now uses Argon2ID
-    return token, token_hash
+def utc_now():
+    return datetime.now(timezone.utc)
 
-def get_or_create_persistent_refresh_token(db: Session, user_id: str) -> tuple[str, str]:
-    """
-    Get existing valid persistent refresh token or create a new one
-    Returns: (token, token_hash)
-    """
+
+def create_persistent_refresh_token(db: Session, user_id: str) -> str | None:
+    """Create a persistent refresh token for biometric authentication (30 days)"""
     try:
-        from models import PersistentRefreshToken
-        import uuid as uuid_module
+        # 1. FORȚEAZĂ CONVERTIREA LA STRING
+        # Chiar dacă primești string, asigură-te că rămâne string până la capăt
+        user_id_str = str(user_id)
         
-        # Convert user_id string to UUID
-        try:
-            user_uuid = uuid_module.UUID(user_id)
-        except ValueError:
-            print(f"ERROR: Invalid user_id format: {user_id}")
-            # Fallback: create new token without storing
-            new_token, new_token_hash = create_persistent_refresh_token(user_id)
-            return new_token, new_token_hash
+        print(f"🔍 Creating token for user_id_str: {user_id_str} (Type: {type(user_id_str)})")
+
+        # 2. Convert string to UUID for database operations
+        from uuid import UUID
+        user_uuid = UUID(user_id_str)
         
-        # Check if user has an active, non-expired persistent token
-        existing_token = db.query(PersistentRefreshToken).filter(
+        # Invalidate existing tokens using UUID
+        db.query(PersistentRefreshToken).filter(
             PersistentRefreshToken.user_id == user_uuid,
-            PersistentRefreshToken.is_active == True,
-            PersistentRefreshToken.expires_at > datetime.utcnow()
-        ).first()
+            PersistentRefreshToken.is_active.is_(True)
+        ).update({"is_active": False})
         
-        if existing_token:
-            print(f"DEBUG: Reusing existing persistent refresh token for user {user_id}, ID: {existing_token.id}")
-            # Update last_used timestamp
-            existing_token.last_used = datetime.utcnow()
-            db.commit()
-            
-            # We need to return the actual token, but we only have the hash
-            # Since we can't reconstruct the original token from the hash,
-            # we'll need to create a new token and update the hash
-            print(f"DEBUG: Creating new token to replace expired one (hash-only storage limitation)")
-            new_token, new_token_hash = create_persistent_refresh_token(user_id)
-            existing_token.token_hash = new_token_hash
-            existing_token.last_used = datetime.utcnow()
-            existing_token.expires_at = datetime.utcnow() + timedelta(days=30)
-            db.commit()
-            print(f"DEBUG: Updated persistent refresh token with new hash, ID: {existing_token.id}")
-            return new_token, new_token_hash
-        else:
-            print(f"DEBUG: No valid existing token found, creating new persistent refresh token for user {user_id}")
-            new_token, new_token_hash = create_persistent_refresh_token(user_id)
-            store_persistent_refresh_token(db, user_id, new_token_hash)
-            return new_token, new_token_hash
-            
-    except Exception as e:
-        print(f"ERROR in get_or_create_persistent_refresh_token: {e}")
-        db.rollback()
-        # Fallback: create new token
-        new_token, new_token_hash = create_persistent_refresh_token(user_id)
-        return new_token, new_token_hash
-
-def store_persistent_refresh_token(db: Session, user_id: str, token_hash: str, deactivate_existing: bool = False) -> bool:
-    """
-    Store a persistent refresh token in the database
-    If deactivate_existing is True, deactivate all existing tokens for this user
-    """
-    try:
-        from models import PersistentRefreshToken
-        import uuid as uuid_module
+        # 3. Create new token
+        # JWT-ul preferă string-uri pentru 'sub'
+        persistent_token = create_refresh_token({"sub": user_id_str}, db=db, user_id=user_id_str, token_type="persistent")
+        persistent_token_hash = hash_token(persistent_token)
         
-        print(f"DEBUG: Storing persistent refresh token for user {user_id}")
-        print(f"DEBUG: Token hash (first 50 chars): {token_hash[:50]}...")
-        
-        # Convert user_id string to UUID
-        try:
-            user_uuid = uuid_module.UUID(user_id)
-        except ValueError:
-            print(f"ERROR: Invalid user_id format: {user_id}")
-            return False
-        
-        # Deactivate existing tokens for this user/device only if requested
-        if deactivate_existing:
-            existing_tokens = db.query(PersistentRefreshToken).filter(
-                PersistentRefreshToken.user_id == user_uuid,
-                PersistentRefreshToken.is_active == True
-            ).all()
-            
-            for token in existing_tokens:
-                token.is_active = False
-            print(f"DEBUG: Deactivated {len(existing_tokens)} existing tokens for user {user_id}")
-        
-        # Create new persistent token
-        persistent_token = PersistentRefreshToken(
-            user_id=user_uuid,
-            token_hash=token_hash,
-            expires_at=datetime.utcnow() + timedelta(days=30)
+        # 4. Save to database
+        new_persistent_token = PersistentRefreshToken(
+            user_id=user_uuid,  # <--- Folosim UUID object for proper database storage
+            token_hash=persistent_token_hash,
+            is_active=True,
+            expires_at=datetime.now(timezone.utc)+ timedelta(days=30)
         )
         
-        db.add(persistent_token)
+        db.add(new_persistent_token)
         db.commit()
-        print(f"DEBUG: Persistent refresh token stored successfully with ID: {persistent_token.id}")
-        return True
+        db.refresh(new_persistent_token)
+        
+        print(f"✅ Persistent token created successfully for user {user_id_str}")
+        return persistent_token 
         
     except Exception as e:
-        print(f"ERROR storing persistent refresh token: {e}")
+        # Printăm eroarea detaliată pentru debug
+        import traceback
+        print(f"❌ Error creating persistent token: {e}")
+        traceback.print_exc() # Aceasta va arăta exact linia care crapă
         db.rollback()
-        return False
+        return None
+def get_or_create_persistent_token(db: Session, user_id: str) -> str | None:
+   
+    user_id_str = str(user_id)
+    from uuid import UUID
+    user_uuid = UUID(user_id)
+    
+    # 1. Verificăm dacă există un token activ și neexpirat
+    existing = db.query(PersistentRefreshToken).filter(
+        PersistentRefreshToken.user_id == user_uuid,
+        PersistentRefreshToken.is_active.is_(True),
+        PersistentRefreshToken.expires_at > datetime.now(timezone.utc)
+    ).first()
+
+    if existing:
+        print(f"♻️ Valid persistent token already exists for user {user_id_str}. Client should use stored one.")
+        return None  # Signal că nu e nevoie de token nou
+
+    # 2. Dacă nu există, creăm unul nou
+    print(f"🆕 No valid persistent token found. Creating new one for {user_id_str}")
+    return create_persistent_refresh_token(db, user_id_str)
+
 
 def verify_persistent_refresh_token(db: Session, token: str) -> tuple[bool, str]:
-    """
-    Verify a persistent refresh token and return (valid, user_id)
+    """Verify a persistent refresh token.
+    
+    Returns:
+        (is_valid, user_id) tuple
     """
     try:
-        from models import PersistentRefreshToken
-        
-        # Get all active persistent tokens
-        persistent_tokens = db.query(PersistentRefreshToken).filter(
-            PersistentRefreshToken.is_active == True,
-            PersistentRefreshToken.expires_at > datetime.utcnow()
-        ).all()
-        
-        # Find the token with matching hash
-        for persistent_token in persistent_tokens:
-            if verify_hashed_token(token, persistent_token.token_hash):
-                # Update last used timestamp
-                persistent_token.last_used = datetime.utcnow()
-                db.commit()
-                return True, str(persistent_token.user_id)
-        
-        return False, ""
-        
-    except Exception as e:
-        print(f"Error verifying persistent refresh token: {e}")
-        return False, ""
+        # Step 1: Decode JWT (validates signature + expiration)
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[ALGORITHM])
 
-def revoke_persistent_refresh_tokens(db: Session, user_id: str) -> int:
-    """
-    Revoke all persistent refresh tokens for a user
-    Returns: number of tokens revoked
-    """
-    try:
-        from models import PersistentRefreshToken
-        import uuid as uuid_module
-        
-        # Convert user_id string to UUID
-        try:
-            user_uuid = uuid_module.UUID(user_id)
-        except ValueError:
-            print(f"ERROR: Invalid user_id format: {user_id}")
-            return 0
-        
-        # Get count before revoking
-        count = db.query(PersistentRefreshToken).filter(
+        # Step 2: Check token type
+        if payload.get("type") != "persistent":
+            logger.warning("Token rejected: wrong type")
+            return False, ""
+
+        user_id = payload.get("sub")
+        if not user_id:
+            logger.warning("Token rejected: missing sub")
+            return False, ""
+
+        # Step 3: Check database record exists
+        # Convert string user_id to UUID for proper comparison
+        from uuid import UUID
+        user_uuid = UUID(user_id)
+        persistent_token = db.query(PersistentRefreshToken).filter(
             PersistentRefreshToken.user_id == user_uuid,
-            PersistentRefreshToken.is_active == True
-        ).count()
-        
-        if count > 0:
-            db.query(PersistentRefreshToken).filter(
-                PersistentRefreshToken.user_id == user_uuid,
-                PersistentRefreshToken.is_active == True
-            ).update({"is_active": False})
-            
+            PersistentRefreshToken.is_active.is_(True),
+            PersistentRefreshToken.expires_at > datetime.now(timezone.utc)
+        ).first()
+
+        if not persistent_token:
+            logger.warning("Token rejected: no active DB record for user %s", user_id)
+            return False, ""
+
+        # Step 4: Verify hash matches (catches cloned tokens)
+        if not verify_hashed_token(token, persistent_token.token_hash):
+    # ⚠️ Someone has a valid JWT but wrong hash = suspicious
+    # Invalidate ALL tokens for this user
+            db.query(PersistentRefreshToken).filter( PersistentRefreshToken.user_id == user_id).update({"is_active": False})
             db.commit()
-            print(f"DEBUG: Revoked {count} persistent refresh tokens for user {user_id}")
-        
-        return count
-        
+    
+            logger.critical("SECURITY: Possible token theft for user %s", user_id)
+            return False, ""
+
+        # Step 5: Update last used
+        persistent_token.last_used = datetime.now(timezone.utc)
+        db.commit()
+
+        return True, user_id
+
+    except jwt.ExpiredSignatureError:
+        logger.info("Token rejected: expired")
+        return False, ""
+    except jwt.InvalidTokenError as e:
+        logger.warning("Token rejected: invalid - %s", e)
+        return False, ""
     except Exception as e:
-        print(f"Error revoking persistent refresh tokens: {e}")
+        logger.error("Token verification error: %s", e, exc_info=True)
         db.rollback()
+        return False, ""
+
+def revoke_persistent_refresh_tokens(
+    db: Session,
+    user_id: str
+) -> int:
+    """
+    Revoke all persistent tokens for a user.
+    """
+
+    try:
+
+        user_uuid = uuid.UUID(user_id)
+
+        revoked_count = db.query(PersistentRefreshToken).filter(
+            PersistentRefreshToken.user_id == user_uuid,
+            PersistentRefreshToken.is_active.is_(True)
+        ).update({
+            "is_active": False
+        })
+
+        db.commit()
+
+        return revoked_count
+
+    except Exception as e:
+
+        db.rollback()
+
+        print(f"ERROR revoking persistent tokens: {e}")
+
         return 0
 
-def cleanup_expired_persistent_tokens(db: Session) -> int:
+
+def cleanup_expired_persistent_tokens(
+    db: Session
+) -> int:
     """
-    Clean up expired persistent tokens
+    Deactivate expired tokens.
     """
+
     try:
-        from models import PersistentRefreshToken
-        
-        deleted_count = db.query(PersistentRefreshToken).filter(
-            PersistentRefreshToken.expires_at < datetime.utcnow()
-        ).delete()
-        
+
+        updated_count = db.query(PersistentRefreshToken).filter(
+            PersistentRefreshToken.expires_at < utc_now(),
+            PersistentRefreshToken.is_active.is_(True)
+        ).update({
+            "is_active": False
+        })
+
         db.commit()
-        return deleted_count
-        
+
+        return updated_count
+
     except Exception as e:
-        print(f"Error cleaning up expired persistent tokens: {e}")
+
         db.rollback()
+
+        print(f"ERROR cleaning expired tokens: {e}")
+
         return 0
+
+# ==================== END-TO-END ENCRYPTION (E2EE) FUNCTIONS ====================
+
+def derive_encryption_key_from_password(password: str, salt: bytes = None) -> Tuple[bytes, bytes]:
+    """
+    Derive an encryption key from user's password using PBKDF2.
+    This key is used to encrypt/decrypt the user's master key.
+    
+    Args:
+        password: User's password
+        salt: Salt for key derivation (generated if not provided)
+    
+    Returns:
+        Tuple of (derived_key, salt)
+    """
+    if salt is None:
+        salt = secrets.token_bytes(16)
+    
+    # Use PBKDF2 with HMAC-SHA256 to derive key from password
+    derived_key = hashlib.pbkdf2_hmac(
+        'sha256',
+        password.encode('utf-8'),
+        salt,
+        100000,  # iterations
+        32       # 32 bytes = 256 bits for AES-256
+    )
+    
+    return derived_key, salt
+
+def encrypt_master_key_with_password(master_key_b64: str, password: str) -> Tuple[str, str]:
+    """
+    Encrypt the user's master key with their password.
+    The encrypted master key is stored in the database.
+    
+    Args:
+        master_key_b64: Base64-encoded master key
+        password: User's password
+    
+    Returns:
+        Tuple of (encrypted_master_key_b64, salt_b64)
+    """
+    # Derive encryption key from password
+    encryption_key, salt = derive_encryption_key_from_password(password)
+    
+    # Encrypt the master key using AES-GCM
+    nonce = os.urandom(12)
+    cipher = Cipher(
+        algorithms.AES(encryption_key),
+        modes.GCM(nonce),
+        backend=default_backend()
+    )
+    encryptor = cipher.encryptor()
+    
+    master_key_bytes = base64.urlsafe_b64decode(master_key_b64.encode())
+    encrypted = encryptor.update(master_key_bytes) + encryptor.finalize()
+    tag = encryptor.tag
+    
+    # Combine nonce + tag + encrypted data
+    combined = nonce + tag + encrypted
+    encrypted_b64 = base64.b64encode(combined).decode('utf-8')
+    salt_b64 = base64.b64encode(salt).decode('utf-8')
+    
+    return encrypted_b64, salt_b64
+
+def decrypt_master_key_with_password(encrypted_master_key_b64: str, salt_b64: str, password: str) -> str:
+    """
+    Decrypt the user's master key using their password.
+    
+    Args:
+        encrypted_master_key_b64: Base64-encoded encrypted master key
+        salt_b64: Base64-encoded salt
+        password: User's password
+    
+    Returns:
+        Base64-encoded master key
+    """
+    # Derive encryption key from password
+    salt = base64.b64decode(salt_b64.encode())
+    encryption_key, _ = derive_encryption_key_from_password(password, salt)
+    
+    # Decrypt the master key
+    combined = base64.b64decode(encrypted_master_key_b64.encode('utf-8'))
+    nonce = combined[:12]
+    tag = combined[12:28]
+    encrypted = combined[28:]
+    
+    cipher = Cipher(
+        algorithms.AES(encryption_key),
+        modes.GCM(nonce, tag),
+        backend=default_backend()
+    )
+    decryptor = cipher.decryptor()
+    
+    decrypted = decryptor.update(encrypted) + decryptor.finalize()
+    master_key_b64 = base64.urlsafe_b64encode(decrypted).decode('utf-8')
+    
+    return master_key_b64
+
+def get_user_encryption_key(master_key_b64: str) -> bytes:
+    """
+    Derive the actual AES encryption key from the user's master key.
+    This is the key used to encrypt/decrypt passwords.
+    
+    Args:
+        master_key_b64: Base64-encoded master key
+    
+    Returns:
+        32-byte encryption key for AES-256
+    """
+    # Use PBKDF2 to derive a consistent key from the master key
+    salt = b'user_encryption_key_salt'  # Fixed salt for consistency
+    derived_key = hashlib.pbkdf2_hmac(
+        'sha256',
+        base64.urlsafe_b64decode(master_key_b64.encode()),
+        salt,
+        100000,
+        32
+    )
+    
+    return derived_key
+
+def encrypt_password_e2e(password: str, master_key_b64: str) -> str:
+    """
+    Encrypt a password using the user's master key (E2EE mode).
+    This uses the same AES-GCM logic as encrypt_password but with user-specific key.
+    
+    Args:
+        password: Password to encrypt
+        master_key_b64: Base64-encoded master key
+    
+    Returns:
+        Base64-encoded encrypted password
+    """
+    # Derive encryption key from master key
+    encryption_key = get_user_encryption_key(master_key_b64)
+    
+    # Use the existing AES-GCM encryption logic
+    return encrypt_password(password, encryption_key)
+
+def decrypt_password_e2e(encrypted_b64: str, master_key_b64: str) -> str:
+    """
+    Decrypt a password using the user's master key (E2EE mode).
+    This uses the same AES-GCM logic as decrypt_password but with user-specific key.
+    
+    Args:
+        encrypted_b64: Base64-encoded encrypted password
+        master_key_b64: Base64-encoded master key
+    
+    Returns:
+        Decrypted password
+    """
+    # Derive encryption key from master key
+    encryption_key = get_user_encryption_key(master_key_b64)
+    
+    # Use the existing AES-GCM decryption logic
+    return decrypt_password(encrypted_b64, encryption_key)
 

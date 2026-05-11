@@ -8,8 +8,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from schemas import (
     UserResponse, Register, UserLogResponse, PasswordCreate, PasswordResponse, 
-    PasswordUpdate, PasswordDecryptResponse, CategoryCreate, CategoryResponse,
-    IPAddressBlockedResponse, IPAddressBlockCreate, IPAddressBlockUpdate
+    PasswordDecryptResponse, CategoryCreate, CategoryResponse,
+    IPAddressBlockedResponse, IPAddressBlockCreate, IPAddressBlockUpdate,
+    E2EESetupRequest, E2EEMasterKeyResponse, PasswordCreateE2EE
 )
 from crud import (
     create_password, get_user_passwords, get_password_by_id, update_password, delete_password,
@@ -18,17 +19,19 @@ from crud import (
 )
 from sqlalchemy.orm import Session
 from database import get_db
-from models import User, RefreshToken, UserLog, Category, IPAddressBlocked
+from models import User, RefreshToken, UserLog, Category, IPAddressBlocked, PersistentRefreshToken
 from security import (
     check_ip_block, block_ip_address, get_delay_for_failed_attempts, 
-    format_duration_ms, get_client_ip, get_or_create_persistent_refresh_token,
-    create_persistent_refresh_token, store_persistent_refresh_token, create_refresh_token, hash_password, 
+    format_duration_ms, get_client_ip, 
+    create_persistent_refresh_token, create_refresh_token, hash_password, 
     verify_password, create_access_token, get_current_user, require_role, 
-    log_user_action, revoke_all_user_tokens, revoke_persistent_refresh_tokens, decrypt_password, 
-    verify_persistent_refresh_token, hash_token, verify_hashed_token
+    log_user_action, revoke_all_user_tokens, revoke_persistent_refresh_tokens, encrypt_password, decrypt_password, 
+    verify_persistent_refresh_token, hash_token, verify_hashed_token,
+    generate_master_key, encrypt_master_key_with_password, decrypt_master_key_with_password, get_or_create_persistent_token
 )
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from fastapi.responses import JSONResponse  
 
 # Configure timezone for Moldova
 MOLDOVA_TZ = ZoneInfo("Europe/Chisinau")
@@ -54,7 +57,7 @@ def root():
 origins = ["http://localhost:8081", "http://127.0.0.1:8081",  "*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
@@ -87,7 +90,7 @@ async def ip_block_middleware(request: Request, call_next):
             return JSONResponse(
                 status_code=429,
                 content={
-                    "detail": f"Adresa IP {ip_address} este blocată. Încearcă din nou peste {ip_block.expires_at.replace(tzinfo=ZoneInfo('UTC')).astimezone(MOLDOVA_TZ) if ip_block.expires_at else ip_block.expires_at}",
+                    "detail": f"Adresa IP {ip_address} este blocată. Încearcă din nou după {ip_block.expires_at.replace(tzinfo=ZoneInfo('UTC')).astimezone(MOLDOVA_TZ).strftime('%d-%m-%Y %H:%M:%S') if ip_block.expires_at else ip_block.expires_at}",
                     "error_code": "IP_BLOCKED",
                     "block_expires_at": ip_block.expires_at.replace(tzinfo=ZoneInfo('UTC')).astimezone(MOLDOVA_TZ).isoformat() if ip_block.expires_at else None
                 }
@@ -108,19 +111,21 @@ def register(user: Register, request: Request, db: Session = Depends(get_db)):
     if db.query(User).filter(User.email == user.email).first():
         raise HTTPException(status_code=400, detail="Email existent")
 
-    new_user = User(username = user.username, email = user.email, role = user.role, password_hash = hash_password(user.password))
+    # Generate master key for E2EE
+    master_key_b64 = generate_master_key()
+    
+    # Encrypt master key with user's password
+    encrypted_master_key, master_key_salt = encrypt_master_key_with_password(master_key_b64, user.password)
+
+    new_user = User( username = user.username, email = user.email, role = user.role, password_hash = hash_password(user.password),
+        encrypted_master_key = encrypted_master_key, master_key_salt = master_key_salt)
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
 
     # Log registration action
-    log_user_action(
-        user_id=str(new_user.id),
-        action="register",
-        request=request,
-        details=f"User {new_user.username} registered successfully",
-        db=db
-    )
+    log_user_action(user_id=str(new_user.id), action="register", request=request,
+        details=f"User {new_user.username} registered successfully", db=db)
 
     # Convert UUID to string for response
     return {
@@ -132,16 +137,6 @@ def register(user: Register, request: Request, db: Session = Depends(get_db)):
 
 @app.post("/auth")
 def auth(request: Request, form_data: LoginForm, db: Session = Depends(get_db)):
-    # Check if IP is blocked first
-    is_blocked, ip_block = check_ip_block(request, db)
-    if is_blocked:
-        ip_address = get_client_ip(request)
-        raise HTTPException(
-            status_code=429,
-            detail=f"Adresa IP {ip_address} este blocată. Încearcă din nou după {ip_block.expires_at.replace(tzinfo=ZoneInfo('UTC')).astimezone(MOLDOVA_TZ) 
-            if ip_block.expires_at else ip_block.expires_at}"
-        )
-
     user = db.query(User).filter(User.username == form_data.username).first()
 
     if not user or not verify_password(form_data.password, user.password_hash):
@@ -149,71 +144,41 @@ def auth(request: Request, form_data: LoginForm, db: Session = Depends(get_db)):
         ip_address = get_client_ip(request)
 
         # Check existing failed attempts for this IP
-        recent_failed_logs = db.query(UserLog).filter(
-            UserLog.ip_address == ip_address,
-            UserLog.action == "login_failed",
-            UserLog.created_at >= datetime.utcnow() - timedelta(hours=1)
-        ).count()
+        recent_failed_logs = db.query(UserLog).filter(UserLog.ip_address == ip_address, UserLog.action == "login_failed",
+            UserLog.created_at >= datetime.utcnow() - timedelta(hours=1)).count()
 
         failed_attempts = recent_failed_logs + 1
         delay = get_delay_for_failed_attempts(failed_attempts)
 
         # Log failed login attempt
         if user:
-            log_user_action(
-                user_id=str(user.id),
-                action="login_failed",
-                request=request,
-                details=f"Failed login attempt for user {user.username}: wrong password (attempt {failed_attempts})",
-                db=db
-            )
+            log_user_action(user_id=str(user.id), action="login_failed", request=request,
+                details=f"Failed login attempt for user {user.username}: wrong password (attempt {failed_attempts})", db=db)
         else:
-            log_user_action(
-                user_id=None,
-                action="login_failed",
-                request=request,
-                details=f"Failed login attempt: username {form_data.username} not found (attempt {failed_attempts})",
-                db=db
-            )
+            log_user_action(user_id=None, action="login_failed", request=request,
+                details=f"Failed login attempt: username {form_data.username} not found (attempt {failed_attempts})", db=db)
 
         # Block IP if threshold reached
         if delay > 0:
-            block_ip_address(
-                ip_address=ip_address,
-                block_duration=delay,
-                username=form_data.username,
-                failed_attempts=failed_attempts,
-                db=db
-            )
+            block_ip_address(ip_address=ip_address, block_duration=delay, username=form_data.username, failed_attempts=failed_attempts, db=db)
 
             if delay == float('inf'):
-                raise HTTPException( status_code=429, detail=f"Prea multe încercări eșuate. Adresa IP {ip_address} blocată permanent.")
+                raise HTTPException( status_code=429, detail=f"Prea multe încercări eșuate. Adresa IP {ip_address} blocată permanent.") 
             else:
                 raise HTTPException( status_code=429,detail=f"Prea multe încercări eșuate. Adresa IP {ip_address} blocată pentru {format_duration_ms(delay).replace('seconds', 'secunde').replace('minutes', 'minute').replace('hours', 'ore')}.")
 
         raise HTTPException(status_code=401, detail="Credențiale invalide")
 
     token_access = create_access_token({"sub": str(user.id), "role": user.role, "username": user.username })
-    token_refresh = create_refresh_token({"sub": str(user.id)})
+    # Create refresh token first
+    token_refresh = create_refresh_token(
+    data={"sub": str(user.id)},
+    db=db,
+    user_id=str(user.id)
+)
 
-    # Extract JTI from token for tracking
-    token_payload = jwt.decode(token_refresh, os.getenv("JWT_SECRET_KEY"), algorithms=["HS256"])
-    token_jti = token_payload.get("jti")
-
-    # Store hashed token for security
-    token_hash = hash_token(token_refresh)
-    new_refresh = RefreshToken( token_hash = token_hash, token_jti = token_jti, user_id = user.id, expires_at = datetime.utcnow() + timedelta(days=7))
-    db.add(new_refresh)
-    db.commit()
     log_user_action(user_id=str(user.id), action="login", request=request, details=f"User {user.username} logged in successfully with password",
     db=db)
-    
-    persistent_token = None
-    if user.role != 'admin':
-        persistent_token, persistent_token_hash = get_or_create_persistent_refresh_token(
-            db, str(user.id)
-        )
-        print(f"DEBUG: Persistent token created for user {user.id}: {persistent_token[:20] if persistent_token else None}...")
     
     response_data = {
         "access_token": token_access,
@@ -222,8 +187,13 @@ def auth(request: Request, form_data: LoginForm, db: Session = Depends(get_db)):
         "expires_in": 3600
     }
     
-    if persistent_token:
-        response_data["persistent_refresh_token"] = persistent_token
+    # Add redirect information based on user role
+    if user.role == "admin":
+        response_data["redirect_to"] = "/admin"
+        response_data["user_role"] = "admin"
+    else:
+        response_data["redirect_to"] = "/user"
+        response_data["user_role"] = "user"
     
     return response_data
 
@@ -260,20 +230,29 @@ def biometric_auth(request: Request, form_data: BiometricAuthForm, db: Session =
     )
     
     # Returnăm un mesaj de succes - clientul va face login-ul normal cu parola decriptată
-    return {
+    response_data = {
         "message": "Biometric authentication ready",
         "user_id": str(user.id),
         "username": user.username,
         "biometric_method": form_data.biometric_method,
         "next_step": "proceed_with_decrypted_password"
     }
+    
+    # Add redirect information based on user role for future reference
+    if user.role == "admin":
+        response_data["redirect_to"] = "/admin"
+        response_data["user_role"] = "admin"
+    else:
+        response_data["redirect_to"] = "/user"
+        response_data["user_role"] = "user"
+    
+    return response_data
 
 @app.post("/auth/biometric/verify")
 def biometric_verify(request: Request, form_data: LoginForm, db: Session = Depends(get_db)):
     """
     Endpoint pentru verificarea finală a credențialelor decriptate biometric.
-    Acesta este apelat după ce clientul decriptează parola cu cheia AES biometrică.
-    """
+    Acesta este apelat după ce clientul decriptează parola cu cheia AES biometrică."""
     user = db.query(User).filter(User.username == form_data.username).first()
     if not user or not verify_password(form_data.password, user.password_hash):
         if user:
@@ -285,7 +264,10 @@ def biometric_verify(request: Request, form_data: LoginForm, db: Session = Depen
         raise HTTPException(status_code=401, detail="Verificare biometrică eșuată")
     
     token_access = create_access_token({"sub": str(user.id), "role": user.role, "username": user.username })
-    token_refresh = create_refresh_token({"sub": str(user.id)})
+    token_refresh = create_refresh_token(
+    db=db,
+    user_id=str(user.id),
+    payload={"sub": str(user.id)})
     
     token_payload = jwt.decode(token_refresh, os.getenv("JWT_SECRET_KEY"), algorithms=["HS256"])
     token_jti = token_payload.get("jti")
@@ -301,6 +283,12 @@ def biometric_verify(request: Request, form_data: LoginForm, db: Session = Depen
     db.add(new_refresh)
     db.commit()
     
+    # Generate persistent refresh token for biometric authentication (30 days)
+    persistent_token, persistent_token_hash = create_persistent_refresh_token(
+        db, str(user.id)
+    )
+    print(f"DEBUG: Persistent token for biometric user {user.id}: {persistent_token[:20]}...")
+    
     # Log successful biometric login
     log_user_action(
         user_id=str(user.id),
@@ -310,13 +298,24 @@ def biometric_verify(request: Request, form_data: LoginForm, db: Session = Depen
         db=db
     )
     
-    return {
+    response_data = {
         "access_token": token_access,
         "refresh_token": token_refresh,
+        "persistent_refresh_token": persistent_token,
         "token_type": "bearer",
         "expires_in": 3600,
         "login_method": "biometric_aes"
     }
+    
+    # Add redirect information based on user role
+    if user.role == "admin":
+        response_data["redirect_to"] = "/admin"
+        response_data["user_role"] = "admin"
+    else:
+        response_data["redirect_to"] = "/user"
+        response_data["user_role"] = "user"
+    
+    return response_data
 
 @app.post("/auth/biometric/direct")
 def direct_biometric_auth(request: Request, form_data: LoginForm, db: Session = Depends(get_db)):
@@ -325,14 +324,25 @@ def direct_biometric_auth(request: Request, form_data: LoginForm, db: Session = 
     Clientul trimite username-ul și parola decriptată biometric.
     Acest endpoint permite autentificarea fără a fi nevoie de login cu parola înainte.
     """
+    # DEBUG: Log incoming request details
+    print(f"DEBUG /auth/biometric/direct request:")
+    print(f"  - Headers: {dict(request.headers)}")
+    print(f"  - Username: {form_data.username}")
+    print(f"  - Password length: {len(form_data.password)}")
+    print(f"  - Password content: '{form_data.password}'")
+    print(f"  - Grant type: {form_data.grant_type}")
+    print(f"  - Client IP: {get_client_ip(request)}")
+    print(f"  - Request body received successfully")
+    
+    # TEMPORARILY DISABLED IP BLOCKING FOR DEBUGGING
     # Verifică dacă IP este blocat
-    is_blocked, ip_block = check_ip_block(request, db)
-    if is_blocked:
-        ip_address = get_client_ip(request)
-        raise HTTPException(
-            status_code=429,
-            detail=f"Adresa IP {ip_address} este blocată. Încearcă din nou după {ip_block.expires_at.replace(tzinfo=ZoneInfo('UTC')).astimezone(MOLDOVA_TZ) if ip_block.expires_at else ip_block.expires_at}"
-        )
+    # is_blocked, ip_block = check_ip_block(request, db)
+    # if is_blocked:
+    #     ip_address = get_client_ip(request)
+    #     raise HTTPException(
+    #         status_code=429,
+    #         detail=f"Adresa IP {ip_address} este blocată. Încearcă din nou după {ip_block.expires_at.replace(tzinfo=ZoneInfo('UTC')).astimezone(MOLDOVA_TZ) if ip_block.expires_at else ip_block.expires_at}"
+    #     )
 
     user = db.query(User).filter(User.username == form_data.username).first()
     if not user:
@@ -394,31 +404,17 @@ def direct_biometric_auth(request: Request, form_data: LoginForm, db: Session = 
 
     # Generează token-uri
     token_access = create_access_token({"sub": str(user.id), "role": user.role, "username": user.username})
-
+    
+    token_refresh = create_refresh_token(
+    data={"sub": str(user.id)},
+    db=db,
+    user_id=str(user.id)
+)
     # Obține sau creează persistent refresh token pentru biometric (30 zile)
     # Reutilizează token-ul existent dacă este încă valid
-    persistent_token, persistent_token_hash = get_or_create_persistent_refresh_token(
-        db, str(user.id)
-    )
-    print(f"DEBUG: Persistent token for user {user.id}: {persistent_token[:20]}...")
-
-    # Creează și refresh token standard (7 zile)
-    token_refresh = create_refresh_token({"sub": str(user.id)})
-
-    # Extract JTI from token for tracking
-    token_payload = jwt.decode(token_refresh, os.getenv("JWT_SECRET_KEY"), algorithms=["HS256"])
-    token_jti = token_payload.get("jti")
-
-    # Store hashed token for security
-    token_hash = hash_token(token_refresh)
-    new_refresh = RefreshToken(
-        token_hash = token_hash,
-        token_jti = token_jti,
-        user_id = user.id,
-        expires_at = datetime.utcnow() + timedelta(days=7)
-    )
-    db.add(new_refresh)
-    db.commit()
+    new_persistent_token = get_or_create_persistent_token(db, str(user.id))
+    
+    db.commit() # Commit pentru eventualele schimbări de status sau creare
 
     # Log successful biometric login
     log_user_action(
@@ -429,15 +425,91 @@ def direct_biometric_auth(request: Request, form_data: LoginForm, db: Session = 
         db=db
     )
 
-    return {
+    response_data = {
         "access_token": token_access,
         "refresh_token": token_refresh,
-        "persistent_refresh_token": persistent_token,
         "token_type": "bearer",
         "expires_in": 3600,
         "login_method": "biometric_direct"
     }
 
+    # Add redirect information based on user role
+    if user.role == "admin":
+        response_data["redirect_to"] = "/admin"
+        response_data["user_role"] = "admin"
+    else:
+        response_data["redirect_to"] = "/user"
+        response_data["user_role"] = "user"
+
+    # Trimitem token-ul DOAR dacă am creat unul nou
+    if new_persistent_token:
+        response_data["persistent_refresh_token"] = new_persistent_token
+        print(f"Sending NEW persistent token to client")
+    else:
+        print(f"Client already has a valid persistent token. Not sending a new one.")
+
+    return response_data
+
+@app.post("/auth/biometric/setup")
+def setup_biometric_auth(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        print(f"🔍 Setup called for user: {current_user.id}")
+
+        if current_user.role == "admin":
+            raise HTTPException(
+                status_code=403,
+                detail="Admin users cannot use biometric authentication"
+            )
+        
+        print(f"🔍 Creating persistent token...")
+        
+        # Convertește UUID la String
+        user_id_str = str(current_user.id)
+        
+        # Creează token-ul persistent în DB
+        persistent_token = create_persistent_refresh_token(db, user_id_str)
+
+        if not persistent_token:
+            raise HTTPException(status_code=500, detail="Nu s-a putut crea token-ul persistent")
+
+        print(f"✅ Token saved in DB for user {user_id_str}")
+            
+        # Logăm acțiunea
+        log_user_action(
+            user_id=user_id_str,
+            action="biometric_setup",
+            request=request,
+            details=f"User {current_user.username} enabled biometric auth. Relogin required.",
+            db=db
+        )
+
+        # Răspuns JSON corect
+        response = JSONResponse(content={
+            "status": "success",
+            "message": "Biometrie activată cu succes. Te rugăm să te deloghezi și să te loghezi din nou pentru a o utiliza.",
+            "requires_relogin": True
+        })
+        
+        
+        response.delete_cookie(key="access_token", path="/")
+        response.delete_cookie(key="refresh_token", path="/")
+        
+        return response
+
+    except Exception as e:
+        # ⚠️ ACEASTA ESTE CHEIA: Returnează JSON chiar și la eroare
+        print(f"❌ CRITICAL ERROR in setup_biometric_auth: {str(e)}")
+        import traceback
+        traceback.print_exc() # Printează stack trace în consolă
+        
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Eroare internă server: {str(e)}"}
+        )
 
 # user, admin
 @app.post("/user")
@@ -450,6 +522,57 @@ def authorize_user(current_user: User = Depends(require_role("user"))):
 def authorize_admin(current_user: User = Depends(require_role("admin"))):
     return {
         "message": f"Hello {current_user.username}, you are authorized as admin!"
+    }
+
+@app.get("/e2ee/master-key")
+def get_encrypted_master_key(current_user: User = Depends(get_current_user)):
+    """
+    Retrieve the encrypted master key for E2EE.
+    The client must decrypt this using the user's password locally.
+    """
+    if not current_user.encrypted_master_key or not current_user.master_key_salt:
+        raise HTTPException(status_code=404, detail="E2EE not enabled for this user")
+    
+    return {
+        "encrypted_master_key": current_user.encrypted_master_key,
+        "master_key_salt": current_user.master_key_salt,
+        "message": "Decrypt this with your password to get your master key"
+    }
+
+@app.post("/e2ee/setup-existing-user", response_model=E2EEMasterKeyResponse)
+def setup_e2ee_for_existing_user(
+    setup_data: E2EESetupRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Enable E2EE for an existing user (created before E2EE was implemented).
+    This generates and stores a master key encrypted with the user's password.
+    """
+    # Verify the password
+    if not verify_password(setup_data.password, current_user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid password")
+    
+    # Check if E2EE is already enabled
+    if current_user.encrypted_master_key:
+        raise HTTPException(status_code=400, detail="E2EE already enabled for this user")
+    
+    # Generate master key
+    master_key_b64 = generate_master_key()
+    
+    # Encrypt master key with user's password
+    encrypted_master_key, master_key_salt = encrypt_master_key_with_password(master_key_b64, setup_data.password)
+    
+    # Store in database
+    current_user.encrypted_master_key = encrypted_master_key
+    current_user.master_key_salt = master_key_salt
+    db.commit()
+    db.refresh(current_user)
+    
+    return {
+        "encrypted_master_key": encrypted_master_key,
+        "master_key_salt": master_key_salt,
+        "message": "E2EE enabled successfully"
     }
 
 @app.post("/password", response_model=PasswordResponse)
@@ -467,6 +590,9 @@ def add_password(password_data: PasswordCreate, request: Request, current_user: 
             if not category:
                 raise HTTPException(status_code=400, detail="Categoria nu a fost găsită")
         
+        # Encrypt password before saving
+        encrypted_password = encrypt_password(password_data.password)
+        
         # Create password
         new_password = create_password(
             db=db,
@@ -474,7 +600,7 @@ def add_password(password_data: PasswordCreate, request: Request, current_user: 
             site_name=password_data.site_name,
             url=password_data.url or "",
             login=password_data.login,
-            password=password_data.password,
+            password_encrypted=encrypted_password,
             description=password_data.description or "",
             category_id=password_data.category_id
         )
@@ -565,63 +691,7 @@ def get_password(password_id: str, current_user: User = Depends(get_current_user
         print(f"ERROR getting password: {str(e)}")
         raise HTTPException(status_code=500, detail="Eroare internă de server")
 
-@app.put("/password/{password_id}", response_model=PasswordResponse)
-def update_password_endpoint(password_id: str, password_data: PasswordUpdate, request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """
-    Update a specific password
-    """
-    try:
-        # Validate category if provided
-        if password_data.category_id:
-            category = db.query(Category).filter(
-                Category.id == password_data.category_id,
-                Category.user_id == current_user.id
-            ).first()
-            if not category:
-                raise HTTPException(status_code=400, detail="Categoria nu a fost găsită")
-        
-        # Update password
-        updated_password = update_password(
-            db=db,
-            password_id=password_id,
-            user_id=str(current_user.id),
-            site_name=password_data.site_name,
-            url=password_data.url,
-            login=password_data.login,
-            password=password_data.password,
-            description=password_data.description,
-            category_id=password_data.category_id
-        )
-        
-        if not updated_password:
-            raise HTTPException(status_code=404, detail="Parola nu a fost găsită")
-        
-        # Log password update
-        log_user_action(
-            user_id=str(current_user.id),
-            action="password_updated",
-            request=request,
-            details=f"Password updated for site: {updated_password.site_name}",
-            db=db
-        )
-        
-        return {
-            "id": str(updated_password.id),
-            "site_name": updated_password.site_name,
-            "url": updated_password.url,
-            "login": updated_password.login,
-            "password_encrypted": updated_password.password_encrypted,
-            "description": updated_password.description,
-            "created_at": updated_password.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if updated_password.created_at else updated_password.created_at,
-            "updated_at": updated_password.updated_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if updated_password.updated_at else updated_password.updated_at,
-            "user_id": str(updated_password.user_id),
-            "category_id": str(updated_password.category_id) if updated_password.category_id else None
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"ERROR updating password: {str(e)}")
-        raise HTTPException(status_code=500, detail="Eroare internă de server")
+
 
 @app.delete("/password/{password_id}")
 def delete_password_endpoint(password_id: str, request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -647,6 +717,123 @@ def delete_password_endpoint(password_id: str, request: Request, current_user: U
         raise
     except Exception as e:
         print(f"ERROR deleting password: {str(e)}")
+        raise HTTPException(status_code=500, detail="Eroare internă de server")
+
+# ==================== E2EE PASSWORD ENDPOINTS ====================
+
+@app.post("/password/e2ee", response_model=PasswordResponse)
+def add_password_e2ee(password_data: PasswordCreateE2EE, request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Add a new password for the current user using E2EE.
+    The password is already encrypted by the client using the user's master key.
+    """
+    try:
+        # Validate category if provided
+        if password_data.category_id:
+            category = db.query(Category).filter(
+                Category.id == password_data.category_id,
+                Category.user_id == current_user.id
+            ).first()
+            if not category:
+                raise HTTPException(status_code=400, detail="Categoria nu a fost găsită")
+        
+        # Create password with already-encrypted data
+        new_password = create_password(
+            db=db,
+            user_id=str(current_user.id),
+            site_name=password_data.site_name,
+            url=password_data.url or "",
+            login=password_data.login,
+            password_encrypted=password_data.password_encrypted,  # Already encrypted by client
+            description=password_data.description or "",
+            category_id=password_data.category_id
+        )
+        
+        # Log password creation
+        log_user_action(
+            user_id=str(current_user.id),
+            action="password_created_e2ee",
+            request=request,
+            details=f"E2EE Password created for site: {password_data.site_name}",
+            db=db
+        )
+        
+        return {
+            "id": str(new_password.id),
+            "site_name": new_password.site_name,
+            "url": new_password.url,
+            "login": new_password.login,
+            "password_encrypted": new_password.password_encrypted,
+            "description": new_password.description,
+            "created_at": new_password.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if new_password.created_at else new_password.created_at,
+            "updated_at": new_password.updated_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if new_password.updated_at else new_password.updated_at,
+            "user_id": str(new_password.user_id),
+            "category_id": str(new_password.category_id) if new_password.category_id else None
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"ERROR creating E2EE password: {str(e)}")
+        raise HTTPException(status_code=500, detail="Eroare internă de server")
+
+@app.put("/password/e2ee/{password_id}", response_model=PasswordResponse)
+def update_password_e2ee(password_id: str, password_data: PasswordCreateE2EE, request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Update a password using E2EE.
+    The password is already encrypted by the client using the user's master key.
+    """
+    try:
+        # Validate category if provided
+        if password_data.category_id:
+            category = db.query(Category).filter(
+                Category.id == password_data.category_id,
+                Category.user_id == current_user.id
+            ).first()
+            if not category:
+                raise HTTPException(status_code=400, detail="Categoria nu a fost găsită")
+        
+        # Update password with already-encrypted data
+        updated_password = update_password(
+            db=db,
+            password_id=password_id,
+            user_id=str(current_user.id),
+            site_name=password_data.site_name,
+            url=password_data.url,
+            login=password_data.login,
+            password_encrypted=password_data.password_encrypted,  # Already encrypted by client
+            description=password_data.description,
+            category_id=password_data.category_id
+        )
+        
+        if not updated_password:
+            raise HTTPException(status_code=404, detail="Parola nu a fost găsită")
+        
+        # Log password update
+        log_user_action(
+            user_id=str(current_user.id),
+            action="password_updated_e2ee",
+            request=request,
+            details=f"E2EE Password updated for site: {updated_password.site_name}",
+            db=db
+        )
+        
+        return {
+            "id": str(updated_password.id),
+            "site_name": updated_password.site_name,
+            "url": updated_password.url,
+            "login": updated_password.login,
+            "password_encrypted": updated_password.password_encrypted,
+            "description": updated_password.description,
+            "created_at": updated_password.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if updated_password.created_at else updated_password.created_at,
+            "updated_at": updated_password.updated_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if updated_password.updated_at else updated_password.updated_at,
+            "user_id": str(updated_password.user_id),
+            "category_id": str(updated_password.category_id) if updated_password.category_id else None
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"ERROR updating E2EE password: {str(e)}")
         raise HTTPException(status_code=500, detail="Eroare internă de server")
 
 @app.post("/category", response_model=CategoryResponse)
@@ -791,7 +978,11 @@ def handle_legacy_bio_auth(request: Request, form_data: LoginForm, db: Session):
 
     # Generate tokens
     token_access = create_access_token({"sub": str(user.id), "role": user.role, "username": user.username})
-    token_refresh = create_refresh_token({"sub": str(user.id)})
+    token_refresh = create_refresh_token(
+    db=db,
+    user_id=str(user.id),
+    payload={"sub": str(user.id)}
+)
     
     # Extract JTI from token for tracking
     token_payload = jwt.decode(token_refresh, os.getenv("JWT_SECRET_KEY"), algorithms=["HS256"])
@@ -829,6 +1020,7 @@ def check_biometric_status(username: str, db: Session = Depends(get_db)):
     """
     Check if biometric authentication is available for a user
     Verifies both local data availability and persistent token status
+    Only available for regular users (not admins)
     """
     try:
         # Check if user exists
@@ -836,23 +1028,29 @@ def check_biometric_status(username: str, db: Session = Depends(get_db)):
         if not user:
             return {"biometric_available": False, "reason": "user_not_found"}
         
+        # Check if user is admin - biometric auth only for regular users
+        if user.role == "admin":
+            return {"biometric_available": False, "reason": "admin_user_not_allowed"}
+        
         # Check if user has active persistent refresh token
         from models import PersistentRefreshToken
-        persistent_token = db.query(PersistentRefreshToken).filter(
-            PersistentRefreshToken.user_id == user.id,  # user.id is already UUID
-            PersistentRefreshToken.is_active == True,
-            PersistentRefreshToken.expires_at > datetime.utcnow()
-        ).first()
-        
+        from sqlalchemy import and_
+        persistent_token = db.query(PersistentRefreshToken).filter(and_(PersistentRefreshToken.user_id == user.id, PersistentRefreshToken.is_active.is_(True), PersistentRefreshToken.expires_at > datetime.utcnow())).first()
+        # 🔥 DEBUG AICI
+        print("TOKEN DEBUG:", {
+        "exists": persistent_token is not None,
+        "is_active": persistent_token.is_active if persistent_token else None,
+        "expires_at": persistent_token.expires_at if persistent_token else None,
+        "now": datetime.utcnow()
+            })
         if not persistent_token:
             return {"biometric_available": False, "reason": "no_active_persistent_token"}
         
         return {
-            "biometric_available": True,
-            "username": username,
-            "token_expires_at": persistent_token.expires_at.isoformat()
+        "biometric_available": persistent_token is not None,
+        "has_persistent_token": persistent_token is not None,
+        "token_expires_at": persistent_token.expires_at.isoformat() if persistent_token else None
         }
-        
     except Exception as e:
         print(f"Error checking biometric status: {e}")
         return {"biometric_available": False, "reason": "server_error"}
@@ -1024,7 +1222,7 @@ def log_user_event(request: Request, log_data: dict, db: Session = Depends(get_d
             print(f"{event_type} logged successfully for username {username}")
             return {"message": f"{event_type} logged successfully", "status": "success"}
         
-        elif event_type in ["set_bio_auth", "disable_bio_auth"]:
+        elif event_type in ["set_bio_auth", "disable_bio_auth", "confirm_bio_auth"]:
             # Handle biometric authentication setup events
             # Find the user by username
             user = db.query(User).filter(User.username == username).first()
@@ -1032,11 +1230,18 @@ def log_user_event(request: Request, log_data: dict, db: Session = Depends(get_d
                 raise HTTPException(status_code=404, detail=f"User {username} not found")
             
             # Map event types to database actions
-            action = "set_bio_auth" if event_type == "set_bio_auth" else "disable_bio_auth"
+            if event_type == "set_bio_auth":
+                action = "set_bio_auth"
+            elif event_type == "confirm_bio_auth":
+                action = "confirm_bio_auth"
+            else:
+                action = "disable_bio_auth"
             bio_method = details.get("bio_method", "aes_key")
             
             if event_type == "set_bio_auth":
                 details_message = f"User {username} enabled biometric authentication using {bio_method}"
+            elif event_type == "confirm_bio_auth":
+                details_message = f"User {username} confirmed biometric authentication using {bio_method}"
             else:
                 details_message = f"User {username} disabled biometric authentication"
                 # Revoke persistent refresh tokens when biometric auth is disabled
@@ -1149,6 +1354,19 @@ def delete_user(user_id: str, request: Request, current_user: User = Depends(req
                 raise HTTPException(status_code=403, detail="Nu poți șterge ultimul admin")
         
         username = user.username
+        
+        # Delete all user's passwords
+        from models import Password, Category, RefreshToken, PersistentRefreshToken
+        db.query(Password).filter(Password.user_id == user.id).delete()
+        
+        # Delete all user's categories
+        db.query(Category).filter(Category.user_id == user.id).delete()
+        
+        # Delete all user's refresh tokens
+        db.query(RefreshToken).filter(RefreshToken.user_id == user.id).delete()
+        
+        # Delete all user's persistent refresh tokens
+        db.query(PersistentRefreshToken).filter(PersistentRefreshToken.user_id == user.id).delete()
         
         # Revoke all user tokens before deletion
         revoked_count = revoke_all_user_tokens(db, str(user.id))
@@ -1411,4 +1629,116 @@ def check_ip_address(
     except Exception as e:
         print(f"ERROR checking IP address: {str(e)}")
         raise HTTPException(status_code=500, detail="Verificarea adresei IP a eșuat")
+
+# Temporary endpoint for testing - clear IP blocks
+@app.post("/admin/clear-ip-blocks")
+def clear_ip_blocks(db: Session = Depends(get_db)):
+    """
+    Clear all IP blocks (for testing purposes only)
+    """
+    try:
+        # Delete all IP blocks
+        deleted_count = db.query(IPAddressBlocked).count()
+        db.query(IPAddressBlocked).delete()
+        db.commit()
+        return {"message": f"Cleared {deleted_count} IP blocks successfully"}
+    except Exception as e:
+        print(f"ERROR clearing IP blocks: {str(e)}")
+        raise HTTPException(status_code=500, detail="Clearing IP blocks failed")
+
+# Temporary endpoint for testing - check IP blocks
+@app.get("/admin/check-ip-blocks")
+def check_ip_blocks(db: Session = Depends(get_db)):
+    """
+    Check all IP blocks (for testing purposes only)
+    """
+    try:
+        blocks = db.query(IPAddressBlocked).all()
+        return {
+            "total_blocks": len(blocks),
+            "blocks": [
+                {
+                    "id": str(block.id),
+                    "ip_address": block.ip_address,
+                    "is_active": block.is_active,
+                    "blocked_at": block.blocked_at,
+                    "expires_at": block.expires_at,
+                    "username": block.username,
+                    "failed_attempts": block.failed_attempts
+                }
+                for block in blocks
+            ]
+        }
+    except Exception as e:
+        print(f"ERROR checking IP blocks: {str(e)}")
+        raise HTTPException(status_code=500, detail="Checking IP blocks failed")
+
+# Temporary endpoint for testing - check user existence
+@app.get("/admin/check-user/{username}")
+def check_user(username: str, db: Session = Depends(get_db)):
+    """
+    Check if user exists and show basic info (for testing purposes only)
+    """
+    try:
+        user = db.query(User).filter(User.username == username).first()
+        if not user:
+            return {"exists": False, "username": username}
+        
+        return {
+            "exists": True,
+            "username": user.username,
+            "id": str(user.id),
+            "role": user.role,
+            "created_at": user.created_at,
+            "has_password_hash": bool(user.password_hash)
+        }
+    except Exception as e:
+        print(f"ERROR checking user: {str(e)}")
+        raise HTTPException(status_code=500, detail="Checking user failed")
+
+# Simple connectivity test endpoint
+@app.get("/test-connectivity")
+def test_connectivity():
+    """
+    Simple endpoint to test connectivity
+    """
+    return {"status": "connected", "timestamp": datetime.utcnow().isoformat()}
+
+# Debug endpoint to test password verification
+@app.post("/debug-auth")
+def debug_auth(request: Request, form_data: LoginForm, db: Session = Depends(get_db)):
+    """
+    Debug endpoint to test password verification step by step
+    """
+    print(f"DEBUG /debug-auth request:")
+    print(f"  - Username: {form_data.username}")
+    print(f"  - Password: {form_data.password}")
+    print(f"  - Grant type: {form_data.grant_type}")
+    
+    user = db.query(User).filter(User.username == form_data.username).first()
+    
+    if not user:
+        print(f"  - User not found in database")
+        return {"exists": False, "reason": "User not found"}
+    
+    print(f"  - User found: {user.username}")
+    print(f"  - User has password hash: {bool(user.password_hash)}")
+    
+    try:
+        is_valid = verify_password(form_data.password, user.password_hash)
+        print(f"  - Password verification result: {is_valid}")
+        return {
+            "exists": True,
+            "username": user.username,
+            "password_valid": is_valid,
+            "has_password_hash": bool(user.password_hash)
+        }
+    except Exception as e:
+        print(f"  - Password verification error: {str(e)}")
+        return {
+            "exists": True,
+            "username": user.username,
+            "password_valid": False,
+            "error": str(e)
+        }
 

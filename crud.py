@@ -29,14 +29,13 @@ def update_user_role(db: Session, user_id: int, new_role: str):
         db.refresh(user)
     return user
 
-def create_password(db: Session, user_id: str, site_name: str, url: str, login: str, password: str, description: str, category_id: str = None):
-    encrypted_password = security.encrypt_password(password)
+def create_password(db: Session, user_id: str, site_name: str, url: str, login: str, password_encrypted: str, description: str, category_id: str = None):
     db_password = models.Password(
         user_id=user_id,
         site_name=site_name,
         url=url,
         login=login,
-        password_encrypted=encrypted_password,
+        password_encrypted=password_encrypted,
         description=description,
         category_id=category_id
     )
@@ -54,7 +53,7 @@ def get_password_by_id(db: Session, password_id: str, user_id: str):
         models.Password.user_id == user_id
     ).first()
 
-def update_password(db: Session, password_id: str, user_id: str, site_name: str = None, url: str = None, login: str = None, password: str = None, description: str = None, category_id: str = None):
+def update_password(db: Session, password_id: str, user_id: str, site_name: str = None, url: str = None, login: str = None, password_encrypted: str = None, description: str = None, category_id: str = None):
     db_password = get_password_by_id(db, password_id, user_id)
     if db_password:
         if site_name:
@@ -63,8 +62,8 @@ def update_password(db: Session, password_id: str, user_id: str, site_name: str 
             db_password.url = url
         if login:
             db_password.login = login
-        if password:
-            db_password.password_encrypted = security.encrypt_password(password)
+        if password_encrypted:
+            db_password.password_encrypted = password_encrypted
         if description:
             db_password.description = description
         if category_id:
