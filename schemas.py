@@ -138,18 +138,3 @@ class IPAddressBlockUpdate(BaseModel):
     block_duration: Optional[int] = Field(None, gt=0, description="Block duration in milliseconds")
     expires_at: Optional[datetime] = None
 
-class E2EESetupRequest(BaseModel):
-    password: constr(min_length=8, max_length=30)
-
-class E2EEMasterKeyResponse(BaseModel):
-    encrypted_master_key: str
-    master_key_salt: str
-    message: str
-
-class PasswordCreateE2EE(BaseModel):
-    site_name: constr(min_length=1, max_length=100)
-    url: Optional[constr(max_length=255)] = None
-    login: constr(min_length=1, max_length=100)
-    password_encrypted: constr(min_length=1)  # Already encrypted by client
-    description: Optional[constr(max_length=500)] = None
-    category_id: Optional[str] = None

@@ -12,8 +12,6 @@ class User(Base):
     email = Column(String, unique=True, nullable=False)
     role = Column(String, nullable=False)
     password_hash = Column(String, nullable=False)
-    encrypted_master_key = Column(Text, nullable=True)  # E2EE: Master key encrypted with user's password
-    master_key_salt = Column(String, nullable=True)  # Salt for deriving key from password
     created_at = Column(DateTime, default=datetime.utcnow)
     passwords = relationship("Password", back_populates="user")
     refresh_tokens = relationship("RefreshToken", back_populates="user")

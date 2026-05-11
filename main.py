@@ -9,8 +9,7 @@ from fastapi.security import OAuth2PasswordBearer
 from schemas import (
     UserResponse, Register, UserLogResponse, PasswordCreate, PasswordResponse, 
     PasswordDecryptResponse, CategoryCreate, CategoryResponse,
-    IPAddressBlockedResponse, IPAddressBlockCreate, IPAddressBlockUpdate,
-    E2EESetupRequest, E2EEMasterKeyResponse, PasswordCreateE2EE
+    IPAddressBlockedResponse, IPAddressBlockCreate, IPAddressBlockUpdate
 )
 from crud import (
     create_password, get_user_passwords, get_password_by_id, update_password, delete_password,
@@ -23,11 +22,11 @@ from models import User, RefreshToken, UserLog, Category, IPAddressBlocked, Pers
 from security import (
     check_ip_block, block_ip_address, get_delay_for_failed_attempts, 
     format_duration_ms, get_client_ip, 
-    create_persistent_refresh_token, create_refresh_token, hash_password, 
-    verify_password, create_access_token, get_current_user, require_role, 
-    log_user_action, revoke_all_user_tokens, revoke_persistent_refresh_tokens, encrypt_password, decrypt_password, 
+    hash_password, verify_password, create_access_token, create_refresh_token, 
+    get_current_user, require_role, 
+    log_user_action, revoke_all_user_tokens, revoke_persistent_refresh_tokens, 
     verify_persistent_refresh_token, hash_token, verify_hashed_token,
-    generate_master_key, encrypt_master_key_with_password, decrypt_master_key_with_password, get_or_create_persistent_token
+    get_or_create_persistent_token
 )
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -111,14 +110,7 @@ def register(user: Register, request: Request, db: Session = Depends(get_db)):
     if db.query(User).filter(User.email == user.email).first():
         raise HTTPException(status_code=400, detail="Email existent")
 
-    # Generate master key for E2EE
-    master_key_b64 = generate_master_key()
-    
-    # Encrypt master key with user's password
-    encrypted_master_key, master_key_salt = encrypt_master_key_with_password(master_key_b64, user.password)
-
-    new_user = User( username = user.username, email = user.email, role = user.role, password_hash = hash_password(user.password),
-        encrypted_master_key = encrypted_master_key, master_key_salt = master_key_salt)
+    new_user = User( username = user.username, email = user.email, role = user.role, password_hash = hash_password(user.password))
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
@@ -524,57 +516,6 @@ def authorize_admin(current_user: User = Depends(require_role("admin"))):
         "message": f"Hello {current_user.username}, you are authorized as admin!"
     }
 
-@app.get("/e2ee/master-key")
-def get_encrypted_master_key(current_user: User = Depends(get_current_user)):
-    """
-    Retrieve the encrypted master key for E2EE.
-    The client must decrypt this using the user's password locally.
-    """
-    if not current_user.encrypted_master_key or not current_user.master_key_salt:
-        raise HTTPException(status_code=404, detail="E2EE not enabled for this user")
-    
-    return {
-        "encrypted_master_key": current_user.encrypted_master_key,
-        "master_key_salt": current_user.master_key_salt,
-        "message": "Decrypt this with your password to get your master key"
-    }
-
-@app.post("/e2ee/setup-existing-user", response_model=E2EEMasterKeyResponse)
-def setup_e2ee_for_existing_user(
-    setup_data: E2EESetupRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    Enable E2EE for an existing user (created before E2EE was implemented).
-    This generates and stores a master key encrypted with the user's password.
-    """
-    # Verify the password
-    if not verify_password(setup_data.password, current_user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid password")
-    
-    # Check if E2EE is already enabled
-    if current_user.encrypted_master_key:
-        raise HTTPException(status_code=400, detail="E2EE already enabled for this user")
-    
-    # Generate master key
-    master_key_b64 = generate_master_key()
-    
-    # Encrypt master key with user's password
-    encrypted_master_key, master_key_salt = encrypt_master_key_with_password(master_key_b64, setup_data.password)
-    
-    # Store in database
-    current_user.encrypted_master_key = encrypted_master_key
-    current_user.master_key_salt = master_key_salt
-    db.commit()
-    db.refresh(current_user)
-    
-    return {
-        "encrypted_master_key": encrypted_master_key,
-        "master_key_salt": master_key_salt,
-        "message": "E2EE enabled successfully"
-    }
-
 @app.post("/password", response_model=PasswordResponse)
 def add_password(password_data: PasswordCreate, request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
@@ -715,123 +656,6 @@ def delete_password_endpoint(password_id: str, request: Request, current_user: U
         raise
     except Exception as e:
         print(f"ERROR deleting password: {str(e)}")
-        raise HTTPException(status_code=500, detail="Eroare internă de server")
-
-# ==================== E2EE PASSWORD ENDPOINTS ====================
-
-@app.post("/password/e2ee", response_model=PasswordResponse)
-def add_password_e2ee(password_data: PasswordCreateE2EE, request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """
-    Add a new password for the current user using E2EE.
-    The password is already encrypted by the client using the user's master key.
-    """
-    try:
-        # Validate category if provided
-        if password_data.category_id:
-            category = db.query(Category).filter(
-                Category.id == password_data.category_id,
-                Category.user_id == current_user.id
-            ).first()
-            if not category:
-                raise HTTPException(status_code=400, detail="Categoria nu a fost găsită")
-        
-        # Create password with already-encrypted data
-        new_password = create_password(
-            db=db,
-            user_id=str(current_user.id),
-            site_name=password_data.site_name,
-            url=password_data.url or "",
-            login=password_data.login,
-            password_encrypted=password_data.password_encrypted,  # Already encrypted by client
-            description=password_data.description or "",
-            category_id=password_data.category_id
-        )
-        
-        # Log password creation
-        log_user_action(
-            user_id=str(current_user.id),
-            action="password_created_e2ee",
-            request=request,
-            details=f"E2EE Password created for site: {password_data.site_name}",
-            db=db
-        )
-        
-        return {
-            "id": str(new_password.id),
-            "site_name": new_password.site_name,
-            "url": new_password.url,
-            "login": new_password.login,
-            "password_encrypted": new_password.password_encrypted,
-            "description": new_password.description,
-            "created_at": new_password.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if new_password.created_at else new_password.created_at,
-            "updated_at": new_password.updated_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if new_password.updated_at else new_password.updated_at,
-            "user_id": str(new_password.user_id),
-            "category_id": str(new_password.category_id) if new_password.category_id else None
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"ERROR creating E2EE password: {str(e)}")
-        raise HTTPException(status_code=500, detail="Eroare internă de server")
-
-@app.put("/password/e2ee/{password_id}", response_model=PasswordResponse)
-def update_password_e2ee(password_id: str, password_data: PasswordCreateE2EE, request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """
-    Update a password using E2EE.
-    The password is already encrypted by the client using the user's master key.
-    """
-    try:
-        # Validate category if provided
-        if password_data.category_id:
-            category = db.query(Category).filter(
-                Category.id == password_data.category_id,
-                Category.user_id == current_user.id
-            ).first()
-            if not category:
-                raise HTTPException(status_code=400, detail="Categoria nu a fost găsită")
-        
-        # Update password with already-encrypted data
-        updated_password = update_password(
-            db=db,
-            password_id=password_id,
-            user_id=str(current_user.id),
-            site_name=password_data.site_name,
-            url=password_data.url,
-            login=password_data.login,
-            password_encrypted=password_data.password_encrypted,  # Already encrypted by client
-            description=password_data.description,
-            category_id=password_data.category_id
-        )
-        
-        if not updated_password:
-            raise HTTPException(status_code=404, detail="Parola nu a fost găsită")
-        
-        # Log password update
-        log_user_action(
-            user_id=str(current_user.id),
-            action="password_updated_e2ee",
-            request=request,
-            details=f"E2EE Password updated for site: {updated_password.site_name}",
-            db=db
-        )
-        
-        return {
-            "id": str(updated_password.id),
-            "site_name": updated_password.site_name,
-            "url": updated_password.url,
-            "login": updated_password.login,
-            "password_encrypted": updated_password.password_encrypted,
-            "description": updated_password.description,
-            "created_at": updated_password.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if updated_password.created_at else updated_password.created_at,
-            "updated_at": updated_password.updated_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if updated_password.updated_at else updated_password.updated_at,
-            "user_id": str(updated_password.user_id),
-            "category_id": str(updated_password.category_id) if updated_password.category_id else None
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"ERROR updating E2EE password: {str(e)}")
         raise HTTPException(status_code=500, detail="Eroare internă de server")
 
 @app.post("/category", response_model=CategoryResponse)
