@@ -660,25 +660,23 @@ def get_passwords(current_user: User = Depends(get_current_user), db: Session = 
         print(f"ERROR getting passwords: {str(e)}")
         raise HTTPException(status_code=500, detail="Eroare internă de server")
 
-@app.get("/password/{password_id}", response_model=PasswordDecryptResponse)
+@app.get("/password/{password_id}", response_model=PasswordResponse)
 def get_password(password_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
-    Get a specific password with decrypted password
+    Get a specific password (encrypted - client will decrypt)
     """
     try:
         password = get_password_by_id(db, password_id, str(current_user.id))
         if not password:
             raise HTTPException(status_code=404, detail="Parola nu a fost găsită")
         
-        # Decrypt the password
-        decrypted_password = decrypt_password(password.password_encrypted)
-        
+        # Return password encrypted - client will decrypt locally
         return {
             "id": str(password.id),
             "site_name": password.site_name,
             "url": password.url,
             "login": password.login,
-            "password": decrypted_password,
+            "password_encrypted": password.password_encrypted,
             "description": password.description,
             "created_at": password.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if password.created_at else password.created_at,
             "updated_at": password.updated_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if password.updated_at else password.updated_at,
