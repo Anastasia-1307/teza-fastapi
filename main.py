@@ -9,7 +9,7 @@ from fastapi.security import OAuth2PasswordBearer
 from schemas import (
     UserResponse, Register, UserLogResponse, PasswordCreate, PasswordResponse, 
     PasswordDecryptResponse, CategoryCreate, CategoryResponse,
-    IPAddressBlockedResponse, IPAddressBlockCreate, IPAddressBlockUpdate
+    IPAddressBlockedResponse, IPAddressBlockCreate
 )
 from crud import (
     create_password, get_user_passwords, get_password_by_id, update_password, delete_password,
@@ -1245,19 +1245,24 @@ def get_ip_blocks(
     Get all IP blocks (admin only)
     """
     ip_blocks = get_all_ip_blocks(db, active_only=active_only, limit=limit)
-    return [
-        {
+    result = []
+    for block in ip_blocks:
+        expires_at_str = block.expires_at.isoformat() if block.expires_at else block.expires_at
+        # Manually add UTC timezone if not present
+        if expires_at_str and not expires_at_str.endswith('Z') and '+' not in expires_at_str:
+            expires_at_str = expires_at_str + '+00:00'
+        print(f"SERVER DEBUG: Sending expires_at={expires_at_str} for IP {block.ip_address}")
+        result.append({
             "id": str(block.id),
             "ip_address": block.ip_address,
-            "blocked_at": block.blocked_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if block.blocked_at else block.blocked_at,
+            "blocked_at": block.blocked_at if block.blocked_at else block.blocked_at,
             "block_duration": block.block_duration,
             "is_active": block.is_active,
             "username": block.username,
             "failed_attempts": block.failed_attempts,
-            "expires_at": block.expires_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if block.expires_at else block.expires_at
-        }
-        for block in ip_blocks
-    ]
+            "expires_at": expires_at_str
+        })
+    return result
 
 @app.get("/admin/ip-blocks/stats")
 def get_ip_block_stats_endpoint(current_user: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
@@ -1298,63 +1303,18 @@ def create_ip_block_admin(
         return {
             "id": str(ip_block.id),
             "ip_address": ip_block.ip_address,
-            "blocked_at": ip_block.blocked_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if ip_block.blocked_at else ip_block.blocked_at,
+            "blocked_at": ip_block.blocked_at if ip_block.blocked_at else ip_block.blocked_at,
             "block_duration": ip_block.block_duration,
             "is_active": ip_block.is_active,
             "username": ip_block.username,
             "failed_attempts": ip_block.failed_attempts,
-            "expires_at": ip_block.expires_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if ip_block.expires_at else ip_block.expires_at,
-            "user_id": str(ip_block.user_id) if ip_block.user_id else None
+            "expires_at": ip_block.expires_at.isoformat() if ip_block.expires_at else ip_block.expires_at
         }
     
     except Exception as e:
         print(f"ERROR creating IP block: {str(e)}")
         raise HTTPException(status_code=500, detail="Crearea blocului IP a eșuat")
 
-@app.put("/admin/ip-blocks/{block_id}", response_model=IPAddressBlockedResponse)
-def update_ip_block_admin(
-    block_id: str,
-    update_data: IPAddressBlockUpdate,
-    request: Request,
-    current_user: User = Depends(require_role("admin")), 
-    db: Session = Depends(get_db)
-):
-    """
-    Update an IP block (admin only)
-    """
-    try:
-        update_dict = update_data.dict(exclude_unset=True)
-        ip_block = update_ip_block(db, block_id, update_dict)
-        
-        if not ip_block:
-            raise HTTPException(status_code=404, detail="Blocul IP nu a fost găsit")
-        
-        # Log admin action
-        log_user_action(
-            user_id=str(current_user.id),
-            action="ip_block_updated",
-            request=request,
-            details=f"Admin {current_user.username} updated IP block for {ip_block.ip_address}",
-            db=db
-        )
-        
-        return {
-            "id": str(ip_block.id),
-            "ip_address": ip_block.ip_address,
-            "blocked_at": ip_block.blocked_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if ip_block.blocked_at else ip_block.blocked_at,
-            "block_duration": ip_block.block_duration,
-            "is_active": ip_block.is_active,
-            "username": ip_block.username,
-            "failed_attempts": ip_block.failed_attempts,
-            "expires_at": ip_block.expires_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if ip_block.expires_at else ip_block.expires_at,
-            "user_id": str(ip_block.user_id) if ip_block.user_id else None
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"ERROR updating IP block: {str(e)}")
-        raise HTTPException(status_code=500, detail="Actualizarea blocului IP a eșuat")
 
 @app.delete("/admin/ip-blocks/{block_id}")
 def delete_ip_block_admin(

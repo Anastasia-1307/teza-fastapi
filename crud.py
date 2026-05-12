@@ -88,13 +88,20 @@ def verify_user_password(db: Session, username: str, password: str) -> bool:
 # IP Address Blocking CRUD operations
 def create_ip_block(db: Session, ip_address: str, block_duration: int, username: str = None, failed_attempts: int = 1):
     """Create a new IP address block"""
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     
     # Calculate expiration time
     expires_at = None
     if block_duration != float('inf'):  # Permanent block
-        moldova_time = datetime.now(MOLDOVA_TZ)
-        expires_at = moldova_time + timedelta(milliseconds=block_duration)
+        # Use local time for calculation to match client timezone
+        from datetime import datetime, timedelta
+        # Get current local time (Moldova timezone)
+        local_time = datetime.now()
+        # Convert milliseconds to seconds for timedelta
+        duration_seconds = block_duration / 1000
+        print(f"DEBUG: block_duration={block_duration}ms, duration_seconds={duration_seconds}s")
+        expires_at = local_time + timedelta(seconds=duration_seconds)
+        print(f"DEBUG: Current local time: {local_time}, Expiration local time: {expires_at}")
     
     # Deactivate existing blocks for this IP
     existing_blocks = db.query(models.IPAddressBlocked).filter(

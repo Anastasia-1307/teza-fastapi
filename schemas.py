@@ -133,8 +133,4 @@ class IPAddressBlockCreate(BaseModel):
     username: Optional[constr(max_length=50)] = None
     failed_attempts: int = Field(default=1, ge=1)
 
-class IPAddressBlockUpdate(BaseModel):
-    is_active: Optional[bool] = None
-    block_duration: Optional[int] = Field(None, gt=0, description="Block duration in milliseconds")
-    expires_at: Optional[datetime] = None
 
