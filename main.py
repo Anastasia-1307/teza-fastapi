@@ -26,7 +26,7 @@ from security import (
     get_current_user, require_role, 
     log_user_action, revoke_all_user_tokens, revoke_persistent_refresh_tokens, 
     verify_persistent_refresh_token, hash_token, verify_hashed_token,
-    get_or_create_persistent_token
+    get_or_create_persistent_token, encrypt_password
 )
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
