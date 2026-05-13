@@ -26,7 +26,7 @@ from security import (
     get_current_user, require_role, 
     log_user_action, revoke_all_user_tokens, revoke_persistent_refresh_tokens, 
     verify_persistent_refresh_token, hash_token, verify_hashed_token,
-    get_or_create_persistent_token, encrypt_password
+    get_or_create_persistent_token, encrypt_password, create_persistent_refresh_token
 )
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -326,15 +326,6 @@ def direct_biometric_auth(request: Request, form_data: LoginForm, db: Session = 
     print(f"  - Client IP: {get_client_ip(request)}")
     print(f"  - Request body received successfully")
     
-    # TEMPORARILY DISABLED IP BLOCKING FOR DEBUGGING
-    # Verifică dacă IP este blocat
-    # is_blocked, ip_block = check_ip_block(request, db)
-    # if is_blocked:
-    #     ip_address = get_client_ip(request)
-    #     raise HTTPException(
-    #         status_code=429,
-    #         detail=f"Adresa IP {ip_address} este blocată. Încearcă din nou după {ip_block.expires_at.replace(tzinfo=ZoneInfo('UTC')).astimezone(MOLDOVA_TZ) if ip_block.expires_at else ip_block.expires_at}"
-    #     )
 
     user = db.query(User).filter(User.username == form_data.username).first()
     if not user:
