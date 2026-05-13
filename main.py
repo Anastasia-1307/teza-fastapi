@@ -554,7 +554,6 @@ def add_password(password_data: PasswordCreate, request: Request, current_user: 
             "password_encrypted": new_password.password_encrypted,
             "description": new_password.description,
             "created_at": new_password.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if new_password.created_at else new_password.created_at,
-            "updated_at": new_password.updated_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if new_password.updated_at else new_password.updated_at,
             "user_id": str(new_password.user_id),
             "category_id": str(new_password.category_id) if new_password.category_id else None
         }
@@ -581,10 +580,9 @@ def get_passwords(current_user: User = Depends(get_current_user), db: Session = 
                 "password_encrypted": password.password_encrypted,
                 "description": password.description,
                 "created_at": password.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if password.created_at else password.created_at,
-                "updated_at": password.updated_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if password.updated_at else password.updated_at,
                 "user_id": str(password.user_id),
                 "category_id": str(password.category_id) if password.category_id else None,
-                "category_name": db.query(Category).filter(Category.id == password.category_id).first().name if password.category_id else None
+                "category_name": password.category.name if password.category else None
             }
             for password in passwords
         ]
@@ -611,7 +609,6 @@ def get_password(password_id: str, current_user: User = Depends(get_current_user
             "password_encrypted": password.password_encrypted,
             "description": password.description,
             "created_at": password.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if password.created_at else password.created_at,
-            "updated_at": password.updated_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if password.updated_at else password.updated_at,
             "user_id": str(password.user_id),
             "category_id": str(password.category_id) if password.category_id else None
         }

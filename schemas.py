@@ -94,7 +94,6 @@ class PasswordResponse(BaseModel):
     password_encrypted: str
     description: Optional[str] = None
     created_at: datetime
-    updated_at: datetime
     user_id: str
     category_id: Optional[str] = None
     category_name: Optional[str] = None
@@ -109,7 +108,6 @@ class PasswordDecryptResponse(BaseModel):
     password: str
     description: Optional[str] = None
     created_at: datetime
-    updated_at: datetime
     user_id: str
     category_id: Optional[str] = None
 

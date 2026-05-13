@@ -36,7 +36,6 @@ class Password(Base):
     password_encrypted = Column(String, nullable=False)
     description = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
     category_id = Column(UUID(as_uuid=True), ForeignKey("categories.id"))
     user = relationship("User", back_populates="passwords")
