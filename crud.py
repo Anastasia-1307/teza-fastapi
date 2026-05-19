@@ -1,11 +1,43 @@
 from schemas import Register
 from sqlalchemy.orm import Session
 import models, schemas, security
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # Configure timezone for Moldova
 MOLDOVA_TZ = ZoneInfo("Europe/Chisinau")
+
+
+def _utc_now_naive() -> datetime:
+    """Return current UTC time as naive datetime to match stored DB values."""
+    return datetime.utcnow()
+
+
+def _is_block_expired(block: models.IPAddressBlocked, reference_time: datetime | None = None) -> bool:
+    """Check whether a block has expired using UTC naive datetimes."""
+    if not block.expires_at:
+        return False
+
+    current_time = reference_time or _utc_now_naive()
+    return block.expires_at <= current_time
+
+
+def _sync_expired_ip_blocks(db: Session) -> None:
+    """Mark expired active IP blocks as inactive before reads/statistics."""
+    current_time = _utc_now_naive()
+    expired_blocks = db.query(models.IPAddressBlocked).filter(
+        models.IPAddressBlocked.is_active == True,
+        models.IPAddressBlocked.expires_at.isnot(None),
+        models.IPAddressBlocked.expires_at <= current_time
+    ).all()
+
+    if not expired_blocks:
+        return
+
+    for block in expired_blocks:
+        block.is_active = False
+
+    db.commit()
 
 def get_user_by_name(db: Session, username: str):
     return db.query(models.User).filter(models.User.username == username).first()
@@ -88,20 +120,13 @@ def verify_user_password(db: Session, username: str, password: str) -> bool:
 # IP Address Blocking CRUD operations
 def create_ip_block(db: Session, ip_address: str, block_duration: int, username: str = None, failed_attempts: int = 1):
     """Create a new IP address block"""
-    from datetime import datetime, timedelta, timezone
-    
+    _sync_expired_ip_blocks(db)
+
     # Calculate expiration time
     expires_at = None
     if block_duration != float('inf'):  # Permanent block
-        # Use local time for calculation to match client timezone
-        from datetime import datetime, timedelta
-        # Get current local time (Moldova timezone)
-        local_time = datetime.now()
-        # Convert milliseconds to seconds for timedelta
         duration_seconds = block_duration / 1000
-        print(f"DEBUG: block_duration={block_duration}ms, duration_seconds={duration_seconds}s")
-        expires_at = local_time + timedelta(seconds=duration_seconds)
-        print(f"DEBUG: Current local time: {local_time}, Expiration local time: {expires_at}")
+        expires_at = _utc_now_naive() + timedelta(seconds=duration_seconds)
     
     # Deactivate existing blocks for this IP
     existing_blocks = db.query(models.IPAddressBlocked).filter(
@@ -128,6 +153,7 @@ def create_ip_block(db: Session, ip_address: str, block_duration: int, username:
 
 def get_ip_block_by_address(db: Session, ip_address: str, active_only: bool = True):
     """Get IP block by address"""
+    _sync_expired_ip_blocks(db)
     query = db.query(models.IPAddressBlocked).filter(models.IPAddressBlocked.ip_address == ip_address)
     
     if active_only:
@@ -137,33 +163,21 @@ def get_ip_block_by_address(db: Session, ip_address: str, active_only: bool = Tr
 
 def is_ip_blocked(db: Session, ip_address: str):
     """Check if IP address is currently blocked"""
-    from datetime import datetime
-    
     ip_block = get_ip_block_by_address(db, ip_address, active_only=True)
     
     if not ip_block:
         return False, None
-    
-    # Check if block has expired
-    moldova_time = datetime.now(MOLDOVA_TZ)
-    if ip_block.expires_at:
-        # Convert expires_at to Moldova timezone for comparison
-        if ip_block.expires_at.tzinfo is None:
-            # If expires_at is naive (UTC), assume it's UTC and convert to Moldova timezone
-            expires_at_moldova = ip_block.expires_at.replace(tzinfo=MOLDOVA_TZ)
-        else:
-            # If expires_at already has timezone, convert to Moldova timezone
-            expires_at_moldova = ip_block.expires_at.astimezone(MOLDOVA_TZ)
-        
-        if expires_at_moldova < moldova_time:
-            ip_block.is_active = False
-            db.commit()
-            return False, None
-    
+
+    if _is_block_expired(ip_block):
+        ip_block.is_active = False
+        db.commit()
+        return False, None
+
     return True, ip_block
 
 def get_all_ip_blocks(db: Session, active_only: bool = False, limit: int = 100):
     """Get all IP blocks"""
+    _sync_expired_ip_blocks(db)
     query = db.query(models.IPAddressBlocked)
     
     if active_only:
@@ -197,50 +211,40 @@ def delete_ip_block(db: Session, block_id: str):
 
 def cleanup_expired_ip_blocks(db: Session) -> int:
     """Clean up expired IP blocks"""
-    from datetime import timedelta
-    
-    moldova_time = datetime.now(MOLDOVA_TZ)
-    expired_blocks = db.query(models.IPAddressBlocked).all()
+    current_time = _utc_now_naive()
+    expired_blocks = db.query(models.IPAddressBlocked).filter(
+        models.IPAddressBlocked.expires_at.isnot(None),
+        models.IPAddressBlocked.expires_at <= current_time
+    ).all()
     
     count = 0
     for block in expired_blocks:
-        if block.expires_at:
-            # Convert expires_at to Moldova timezone for comparison
-            if block.expires_at.tzinfo is None:
-                # If expires_at is naive (UTC), assume it's UTC and convert to Moldova timezone
-                expires_at_moldova = block.expires_at.replace(tzinfo=MOLDOVA_TZ)
-            else:
-                # If expires_at already has timezone, convert to Moldova timezone
-                expires_at_moldova = block.expires_at.astimezone(MOLDOVA_TZ)
-            
-            if expires_at_moldova < moldova_time:
-                db.delete(block)
-                count += 1
+        db.delete(block)
+        count += 1
     
     db.commit()
     return count
 
 def get_ip_block_stats(db: Session):
     """Get IP blocking statistics"""
-    from datetime import datetime, timedelta
-    
+    _sync_expired_ip_blocks(db)
+
     total_active = db.query(models.IPAddressBlocked).filter(models.IPAddressBlocked.is_active == True).count()
     total_blocks = db.query(models.IPAddressBlocked).count()
     
     # Blocks in last 24 hours
-    moldova_time = datetime.now(MOLDOVA_TZ)
-    yesterday = moldova_time - timedelta(days=1)
+    current_time = _utc_now_naive()
+    yesterday = current_time - timedelta(days=1)
     recent_blocks = db.query(models.IPAddressBlocked).filter(
         models.IPAddressBlocked.blocked_at >= yesterday
     ).count()
     
     # Expiring soon (next hour)
-    moldova_time = datetime.now(MOLDOVA_TZ)
-    next_hour = moldova_time + timedelta(hours=1)
+    next_hour = current_time + timedelta(hours=1)
     expiring_soon = db.query(models.IPAddressBlocked).filter(
         models.IPAddressBlocked.is_active == True,
         models.IPAddressBlocked.expires_at <= next_hour,
-        models.IPAddressBlocked.expires_at > moldova_time
+        models.IPAddressBlocked.expires_at > current_time
     ).count()
     
     return {
