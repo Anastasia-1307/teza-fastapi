@@ -1122,6 +1122,18 @@ def update_user_role(user_id: str, role_data: dict, request: Request, current_us
         old_role = user.role
         user.role = new_role
         db.commit()
+
+        if old_role != "admin" and new_role == "admin":
+            revoked_bio_tokens = revoke_persistent_refresh_tokens(db, str(user.id))
+            if revoked_bio_tokens > 0:
+                print(f"Revoked {revoked_bio_tokens} persistent biometric tokens for user {user.username} after promotion to admin")
+                log_user_action(
+                    user_id=str(user.id),
+                    action="disable_bio_auth",
+                    request=request,
+                    details=f"Biometric authentication disabled automatically after user {user.username} was promoted to admin by {current_user.username}",
+                    db=db
+                )
         
         # Revoke all user tokens to force re-login with new role
         revoked_count = revoke_all_user_tokens(db, str(user.id))
@@ -1215,7 +1227,7 @@ def get_user_logs(current_user: User = Depends(require_role("admin")), db: Sessi
             "ip_address": log.ip_address,
             "user_agent": log.user_agent,
             "details": log.details,
-            "created_at": log.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(MOLDOVA_TZ) if log.created_at else log.created_at
+            "created_at": log.created_at
         }
         for log in logs
     ]
